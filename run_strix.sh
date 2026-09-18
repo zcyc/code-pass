@@ -101,6 +101,15 @@ case "$OUTPUT_ROOT" in
   /*) ;;
   *) OUTPUT_ROOT="$(pwd -P)/$OUTPUT_ROOT" ;;
 esac
+if [[ -d "$OUTPUT_ROOT" ]]; then
+  OUTPUT_ROOT="$(cd "$OUTPUT_ROOT" 2>/dev/null && pwd -P)" || {
+    echo "ERROR: unable to resolve STRIX_OUTPUT_DIR: $OUTPUT_ROOT" >&2
+    exit 1
+  }
+fi
+case "$OUTPUT_ROOT/" in
+  "$SOURCE_DIR/"*) echo "ERROR: STRIX_OUTPUT_DIR must be outside the project directory: $OUTPUT_ROOT" >&2; exit 1 ;;
+esac
 readonly OUTPUT_ROOT
 RUN_ID="${STRIX_RUN_ID:-${PROJECT_NAME}-$(date '+%Y%m%d-%H%M%S')-$$}"
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "ERROR: invalid STRIX_RUN_ID: $RUN_ID" >&2; exit 1; }
@@ -110,6 +119,14 @@ TMP_ROOT="${TMPDIR:-/tmp}"
 case "$TMP_ROOT" in
   /*) ;;
   *) TMP_ROOT="$(pwd -P)/$TMP_ROOT" ;;
+esac
+[[ -d "$TMP_ROOT" ]] || { echo "ERROR: TMPDIR does not exist: $TMP_ROOT" >&2; exit 1; }
+TMP_ROOT="$(cd "$TMP_ROOT" 2>/dev/null && pwd -P)" || {
+  echo "ERROR: unable to resolve TMPDIR: $TMP_ROOT" >&2
+  exit 1
+}
+case "$TMP_ROOT/" in
+  "$SOURCE_DIR/"*) echo "ERROR: TMPDIR must be outside the project directory: $TMP_ROOT" >&2; exit 1 ;;
 esac
 WORK_DIR="$(mktemp -d "${TMP_ROOT}/strix-local-${RUN_ID}.XXXXXX")"
 readonly WORK_DIR
@@ -160,13 +177,16 @@ def prune(root: str):
         kept = []
         for name in dirs:
             p = curp / name
-            if name.startswith('.') or name in DIR_NAMES or (name == 'target' and p != root):
+            if p.is_symlink() or name.startswith('.') or name in DIR_NAMES or (name == 'target' and p != root):
                 rm_path(p); removed_dirs += 1
             else:
                 kept.append(name)
         dirs[:] = kept
         for name in files:
             p = curp / name
+            if p.is_symlink():
+                rm_path(p); removed_files += 1
+                continue
             suffix = p.suffix.lower()
             if name.startswith('.') or suffix in FILE_SUFFIXES:
                 rm_path(p); removed_files += 1
@@ -304,6 +324,8 @@ readonly STRIX_SANDBOX_SHM_SIZE="${STRIX_SANDBOX_SHM_SIZE:-1g}"
 readonly PROJECT_INSTRUCTION_FILE="${TARGET_DIR}/.strix-instructions.md"
 readonly SCAN_LOG="${ARTIFACT_DIR}/strix-console.log"
 readonly SANDBOX_NETWORK="strix-local-${RUN_ID}"
+readonly STRIX_MANAGED_LABEL="strix-managed=true"
+readonly STRIX_RUN_LABEL="strix-run-id=${RUN_ID}"
 readonly STRIX_FAIL_ON_CONTEXT_ERROR="${STRIX_FAIL_ON_CONTEXT_ERROR:-true}"
 readonly STRIX_NETWORK_RETRIES="${STRIX_NETWORK_RETRIES:-${STRIX_CONTENT_FILTER_RETRIES:-1}}"
 
@@ -386,8 +408,6 @@ STRIX_ATTEMPT_BUDGET="$(python3 "$PIPELINE_UTILS" retry-budget "$STRIX_BUDGET" "
 readonly STRIX_ATTEMPT_BUDGET
 
 command -v docker >/dev/null || die "docker is required"
-docker info >/dev/null 2>&1 || die "Docker daemon is unavailable to the current user"
-
 # Normalize STRIX_TIMEOUT to seconds. The local runner can use GNU timeout,
 # Homebrew gtimeout, or a small Python fallback, so macOS does not need
 # coreutils installed.
@@ -409,6 +429,8 @@ PY
 )" || die "Invalid STRIX_TIMEOUT: $STRIX_TIMEOUT (use forms like 9h30m, 9h, 570m, 34200s)"
 [[ "$STRIX_TIMEOUT_SECONDS" -gt 0 ]] || die "Scan timeout must be positive"
 readonly STRIX_TIMEOUT_SECONDS
+
+docker info >/dev/null 2>&1 || die "Docker daemon is unavailable to the current user"
 
 TIMEOUT_BIN=""
 if command -v timeout >/dev/null 2>&1; then
@@ -631,11 +653,20 @@ cleanup_scope() {
 
 cleanup_sandbox() {
   local -a container_ids=()
+  local network_labels
 
   if [[ "$network_active" -ne 1 ]]; then
     return
   fi
   network_active=0
+
+  network_labels="$(docker network inspect "$SANDBOX_NETWORK" \
+    --format '{{ index .Labels "strix-managed" }}|{{ index .Labels "strix-run-id" }}' \
+    2>/dev/null || true)"
+  if [[ "$network_labels" != "true|$RUN_ID" ]]; then
+    echo "Refusing to clean an unrecognized Strix network: $SANDBOX_NETWORK" >&2
+    return
+  fi
 
   while IFS= read -r container_id; do
     [[ -n "$container_id" ]] && container_ids[${#container_ids[@]}]="$container_id"
@@ -676,8 +707,8 @@ trap cleanup_all EXIT
 
 network_active=1
 docker network create \
-  --label "uk.kkpoker.strix-managed=true" \
-  --label "uk.kkpoker.strix-run-id=${RUN_ID}" \
+  --label "$STRIX_MANAGED_LABEL" \
+  --label "$STRIX_RUN_LABEL" \
   "$SANDBOX_NETWORK" >/dev/null
 
 # Strix applies these values when it creates this job's Docker sandbox.
@@ -827,8 +858,8 @@ while (( attempt < max_attempts )); do
     fi
     cleanup_sandbox
     network_active=1
-    if ! docker network create --label "uk.kkpoker.strix-managed=true" \
-      --label "uk.kkpoker.strix-run-id=${RUN_ID}" "$SANDBOX_NETWORK" >/dev/null; then
+    if ! docker network create --label "$STRIX_MANAGED_LABEL" \
+      --label "$STRIX_RUN_LABEL" "$SANDBOX_NETWORK" >/dev/null; then
       break
     fi
     echo "NOTICE: Retrying transport failure within reserved total time/budget; previous state preserved." | tee -a "$SCAN_LOG"

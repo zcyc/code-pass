@@ -153,6 +153,15 @@ case "$PI_OUTPUT_ROOT" in
   /*) ;;
   *) PI_OUTPUT_ROOT="$(pwd -P)/$PI_OUTPUT_ROOT" ;;
 esac
+case "$PI_OUTPUT_ROOT/" in
+  "$PROJECT_DIR/"*) die "PI_OUTPUT_DIR must be outside the project directory: $PI_OUTPUT_ROOT" ;;
+esac
+mkdir -p "$PI_OUTPUT_ROOT" || die "cannot create Pi output root: $PI_OUTPUT_ROOT"
+PI_OUTPUT_ROOT="$(cd "$PI_OUTPUT_ROOT" 2>/dev/null && pwd -P)" ||
+  die "cannot resolve Pi output root: $PI_OUTPUT_ROOT"
+case "$PI_OUTPUT_ROOT/" in
+  "$PROJECT_DIR/"*) die "PI_OUTPUT_DIR must be outside the project directory: $PI_OUTPUT_ROOT" ;;
+esac
 readonly PI_OUTPUT_ROOT
 
 if [[ -f "$STATUS_FILE" ]]; then
@@ -163,7 +172,6 @@ if [[ -f "$STATUS_FILE" ]]; then
 fi
 
 FIX_ID="${PROJECT_NAME}-$(date '+%Y%m%d-%H%M%S')-$$"
-mkdir -p "$PI_OUTPUT_ROOT" || die "cannot create Pi output root: $PI_OUTPUT_ROOT"
 FIX_DIR="$PI_OUTPUT_ROOT/$FIX_ID"
 if ! mkdir "$FIX_DIR"; then
   die "Pi output directory already exists or cannot be created: $FIX_DIR"
@@ -176,23 +184,20 @@ STATUS_AFTER="$FIX_DIR/git-status-after.txt"
 DIFF_FILE="$FIX_DIR/changes.diff"
 META_FILE="$FIX_DIR/metadata.txt"
 
-append_untracked_diffs() {
-  local repo="$1"
-  local path
-  while IFS= read -r -d '' path; do
-    printf '\n# Untracked file: %s\n' "$path"
-    (
-      cd "$repo"
-      git diff --no-index --binary -- /dev/null "$path" || true
-    )
-  done < <(git -C "$repo" ls-files --others --exclude-standard -z)
-}
-
 if command -v git >/dev/null 2>&1 && git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git -C "$PROJECT_DIR" status --short --untracked-files=all > "$STATUS_BEFORE" || true
   BASE_REV="$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  BASELINE_INDEX="$FIX_DIR/git-index-before"
+  if git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+    GIT_INDEX_FILE="$BASELINE_INDEX" git -C "$PROJECT_DIR" read-tree HEAD
+  else
+    GIT_INDEX_FILE="$BASELINE_INDEX" git -C "$PROJECT_DIR" read-tree --empty
+  fi
+  GIT_INDEX_FILE="$BASELINE_INDEX" git -C "$PROJECT_DIR" add -A -- .
+  BASELINE_TREE="$(GIT_INDEX_FILE="$BASELINE_INDEX" git -C "$PROJECT_DIR" write-tree)"
 else
   BASE_REV="not-a-git-repository"
+  BASELINE_TREE=""
   : > "$STATUS_BEFORE"
 fi
 
@@ -323,14 +328,15 @@ set -e
 
 if command -v git >/dev/null 2>&1 && git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git -C "$PROJECT_DIR" status --short --untracked-files=all > "$STATUS_AFTER" || true
-  {
-    echo "# Unstaged diff"
-    git -C "$PROJECT_DIR" diff --no-ext-diff --binary || true
-    echo
-    echo "# Staged diff"
-    git -C "$PROJECT_DIR" diff --cached --no-ext-diff --binary || true
-    append_untracked_diffs "$PROJECT_DIR"
-  } > "$DIFF_FILE"
+  AFTER_INDEX="$FIX_DIR/git-index-after"
+  if git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+    GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" read-tree HEAD
+  else
+    GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" read-tree --empty
+  fi
+  GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" add -A -- .
+  GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" diff --cached --no-ext-diff --binary "$BASELINE_TREE" -- > "$DIFF_FILE" || true
+  rm -f "$BASELINE_INDEX" "$AFTER_INDEX"
 else
   : > "$STATUS_AFTER"
   : > "$DIFF_FILE"

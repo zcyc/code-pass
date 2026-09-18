@@ -79,6 +79,8 @@ STRIX_OUTPUT_DIR=/path/to/scan-results \
   ./run_strix.sh --auto /path/to/project standard
 ```
 
+输出根目录必须位于项目目录之外，避免扫描结果被再次复制进扫描工作区或修改项目目录。
+
 扫描完成后，命令行会打印实际的 `Results` 路径。后续运行 `run_pi.sh` 时，应使用这次扫描打印出的具体目录，不要依赖目录排序猜测最新结果。
 
 ### 2. 使用 Pi 处理扫描结果
@@ -116,7 +118,7 @@ PI_FIX_DRY_RUN=true ./run_pi.sh --auto /path/to/project \
 
 非 dry-run 且 `PI_FIX_ALLOW_BREAKING=true` 时，Pi 可以修改项目中的必要文件。`PI_FIX_DRY_RUN=true` 或 `PI_FIX_ALLOW_BREAKING=false` 都会启用 Pi 的只读工具白名单，禁止文件修改。
 
-Pi 修复结果默认写入独立目录 `~/pi_runs/<project>-<timestamp>-<pid>/`，不会写回 Strix 扫描结果目录。可通过 `PI_OUTPUT_DIR` 修改输出根目录。
+Pi 修复结果默认写入独立目录 `~/pi_runs/<project>-<timestamp>-<pid>/`，不会写回 Strix 扫描结果目录。可通过 `PI_OUTPUT_DIR` 修改输出根目录，但该目录必须位于项目目录之外。
 
 ## 常用环境变量
 
@@ -198,7 +200,7 @@ Pi 的产物保存在独立的 `~/pi_runs/<project>-<timestamp>-<pid>/` 目录�
 重点检查：
 
 - `pi-summary.md`：Pi 的自动运行摘要；交互模式下是会话说明。
-- `changes.diff`：项目修改前后的差异。
+- `changes.diff`：仅本次 Pi 运行产生的项目差异，不包含运行前已存在的修改。
 - `git-status-after.txt`：修复完成后的 Git 状态。
 - `metadata.txt`：本次修复的输入路径、模式和退出码。
 
