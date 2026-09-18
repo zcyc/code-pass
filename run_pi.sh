@@ -6,7 +6,7 @@ VERSION="1.3.1"
 usage() {
   cat <<'USAGE'
 Usage:
-  run_pi_fix_latest.sh [--interactive|--auto] <local-project-dir> <strix-scan-result>
+  run_pi.sh [--interactive|--auto] <local-project-dir> <strix-scan-result>
 
 Arguments:
   local-project-dir   Local repository Pi should modify.
@@ -32,16 +32,17 @@ Default policy is intentionally noise-reduction oriented:
 
 Environment variables:
   PI_BIN                 pi executable. Default: pi from PATH
-  PI_FIX_DRY_RUN         true => triage/report only, do not modify files
-  PI_FIX_ALLOW_BREAKING  true => allow pi to make an unavoidable breaking fix
-                         for a verified High/Critical issue. Default true.
-                         Set false if you only want suggestions for breaking fixes.
+  PI_OUTPUT_DIR          Pi result root. Default: ~/pi_runs
+  PI_FIX_DRY_RUN         true => use Pi's read-only tools; do not modify files
+  PI_FIX_ALLOW_BREAKING  true => allow file edits, including unavoidable
+                         breaking fixes, for verified High/Critical issues.
+                         Default true. Set false for a read-only run.
 
 Examples:
-  ./run_pi_fix_latest.sh ~/src/my-project ~/strix_runs/my-project_0f73
-  ./run_pi_fix_latest.sh ~/src/my-project ~/strix_runs/my-project_0f73/findings.sarif
-  ./run_pi_fix_latest.sh --auto ~/src/my-project ~/strix_runs/my-project_0f73
-  PI_FIX_DRY_RUN=true ./run_pi_fix_latest.sh ~/src/my-project ~/strix_runs/my-project_0f73
+  ./run_pi.sh ~/src/my-project ~/strix_runs/my-project_0f73
+  ./run_pi.sh ~/src/my-project ~/strix_runs/my-project_0f73/findings.sarif
+  ./run_pi.sh --auto ~/src/my-project ~/strix_runs/my-project_0f73
+  PI_FIX_DRY_RUN=true ./run_pi.sh ~/src/my-project ~/strix_runs/my-project_0f73
 USAGE
 }
 die() {
@@ -54,7 +55,7 @@ POSITIONAL=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)
-      echo "run_pi_fix_latest ${VERSION}"
+      echo "run_pi ${VERSION}"
       exit 0
       ;;
     -h|--help)
@@ -120,6 +121,9 @@ fi
 readonly SCAN_DIR LATEST_SARIF
 
 PI_BIN="${PI_BIN:-$(command -v pi 2>/dev/null || true)}"
+if [[ "$PI_BIN" != */* ]]; then
+  PI_BIN="$(command -v "$PI_BIN" 2>/dev/null || true)"
+fi
 [[ -n "$PI_BIN" && -x "$PI_BIN" ]] || die "pi executable not found; set PI_BIN or install pi"
 readonly PI_BIN
 
@@ -129,6 +133,12 @@ PI_FIX_ALLOW_BREAKING="${PI_FIX_ALLOW_BREAKING:-true}"
 case "$PI_FIX_DRY_RUN" in true|false) ;; *) die "PI_FIX_DRY_RUN must be true or false" ;; esac
 case "$PI_FIX_ALLOW_BREAKING" in true|false) ;; *) die "PI_FIX_ALLOW_BREAKING must be true or false" ;; esac
 
+PI_READ_ONLY="false"
+if [[ "$PI_FIX_DRY_RUN" == "true" || "$PI_FIX_ALLOW_BREAKING" == "false" ]]; then
+  PI_READ_ONLY="true"
+fi
+readonly PI_READ_ONLY
+
 PROJECT_NAME="$(basename "$PROJECT_DIR")"
 PROJECT_NAME="$(printf '%s' "$PROJECT_NAME" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
 [[ -n "$PROJECT_NAME" ]] || PROJECT_NAME="project"
@@ -137,6 +147,13 @@ REPORT_FILE="$SCAN_DIR/penetration_test_report.md"
 STATUS_FILE="$SCAN_DIR/scan-status.txt"
 SCAN_LOG="$SCAN_DIR/strix-console.log"
 
+PI_OUTPUT_ROOT="${PI_OUTPUT_DIR:-${HOME:?HOME is required}/pi_runs}"
+case "$PI_OUTPUT_ROOT" in
+  /*) ;;
+  *) PI_OUTPUT_ROOT="$(pwd -P)/$PI_OUTPUT_ROOT" ;;
+esac
+readonly PI_OUTPUT_ROOT
+
 if [[ -f "$STATUS_FILE" ]]; then
   scan_status="$(sed -n 's/^status=//p' "$STATUS_FILE" | head -n1)"
   if [[ -n "$scan_status" && "$scan_status" != "success" ]]; then
@@ -144,9 +161,12 @@ if [[ -f "$STATUS_FILE" ]]; then
   fi
 fi
 
-FIX_ID="$(date '+%Y%m%d-%H%M%S')-$$"
-FIX_DIR="$SCAN_DIR/pi-fix-$FIX_ID"
-mkdir -p "$FIX_DIR"
+FIX_ID="${PROJECT_NAME}-$(date '+%Y%m%d-%H%M%S')-$$"
+mkdir -p "$PI_OUTPUT_ROOT" || die "cannot create Pi output root: $PI_OUTPUT_ROOT"
+FIX_DIR="$PI_OUTPUT_ROOT/$FIX_ID"
+if ! mkdir "$FIX_DIR"; then
+  die "Pi output directory already exists or cannot be created: $FIX_DIR"
+fi
 readonly FIX_DIR
 PROMPT_FILE="$FIX_DIR/prompt.md"
 SUMMARY_FILE="$FIX_DIR/pi-summary.md"
@@ -154,6 +174,18 @@ STATUS_BEFORE="$FIX_DIR/git-status-before.txt"
 STATUS_AFTER="$FIX_DIR/git-status-after.txt"
 DIFF_FILE="$FIX_DIR/changes.diff"
 META_FILE="$FIX_DIR/metadata.txt"
+
+append_untracked_diffs() {
+  local repo="$1"
+  local path
+  while IFS= read -r -d '' path; do
+    printf '\n# Untracked file: %s\n' "$path"
+    (
+      cd "$repo"
+      git diff --no-index --binary -- /dev/null "$path" || true
+    )
+  done < <(git -C "$repo" ls-files --others --exclude-standard -z)
+}
 
 if command -v git >/dev/null 2>&1 && git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git -C "$PROJECT_DIR" status --short --untracked-files=all > "$STATUS_BEFORE" || true
@@ -172,10 +204,12 @@ report=$REPORT_FILE
 base_revision=$BASE_REV
 dry_run=$PI_FIX_DRY_RUN
 allow_breaking=$PI_FIX_ALLOW_BREAKING
+read_only=$PI_READ_ONLY
 mode=$PI_MODE
 started_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
 EOF_META
 
+# shellcheck disable=SC1111
 cat > "$PROMPT_FILE" <<EOF_PROMPT
 你正在对一个本地代码仓库执行 Strix 扫描结果的自动分诊与修复。当前工作目录就是要修改的真实项目目录：
 
@@ -185,6 +219,7 @@ cat > "$PROMPT_FILE" <<EOF_PROMPT
 - 扫描日志：$SCAN_LOG
 - 是否 dry-run：$PI_FIX_DRY_RUN
 - 是否允许不可避免的破坏性修复：$PI_FIX_ALLOW_BREAKING
+- 是否只读：$PI_READ_ONLY
 
 目标不是“把所有扫描项都修掉”，而是“最大限度降低无意义中低危噪音，只修改真正值得修的安全问题”。请直接完成整个任务，不要向用户提问。
 
@@ -206,7 +241,7 @@ cat > "$PROMPT_FILE" <<EOF_PROMPT
 【修复原则】
 12. 修复时采用最小改动，尽量保持现有 API、协议、数据格式、配置、调用方式和用户可观察行为兼容。不要做无关重构。
 13. Low/Medium 如果需要破坏兼容性、数据库 schema/数据迁移、公开 API 变更、权限模型重构、大范围依赖升级或跨模块重写，默认不要改，改为记录设计/风险并忽略该扫描项。
-14. High/Critical 若真实且必须通过破坏性改变才能可靠解决：当 PI_FIX_ALLOW_BREAKING=false 时不要实施，只在最终总结列出“建议的破坏性修复”；当为 true 时才允许实施最小必要改动，并在最终总结最前面明确列出影响、迁移办法和回滚注意事项。
+14. 当 PI_FIX_ALLOW_BREAKING=false 时，本次运行处于只读建议模式，不实施任何文件修改；对需要破坏性改变的问题只在最终总结列出“建议的破坏性修复”。当为 true 时才允许实施最小必要改动，并在最终总结最前面明确列出影响、迁移办法和回滚注意事项。
 15. 尽量不改数据库。优先在应用层做输入约束、授权、参数化、安全默认值或边界校验。不要自动执行 migration、DDL 或数据修复。若数据库变更确实是 High/Critical 的唯一合理方案，遵循上一条破坏性改动规则。
 16. 依赖漏洞只在扫描项确实对应可达/使用中的受影响组件时处理；优先最小兼容版本升级，不要顺手全量升级依赖。若实际不可达或仅开发依赖且无现实影响，可以忽略并说明。
 17. 不要通过删除安全校验、关闭 lint/test、安全扫描规则、吞掉异常、扩大 allowlist、硬编码 bypass、降低认证授权要求等方式“修复扫描结果”。
@@ -220,7 +255,7 @@ cat > "$PROMPT_FILE" <<EOF_PROMPT
 【执行方式】
 22. 先读取 SARIF 和 Markdown 报告（若存在），整理所有 findings；对重复根因合并分析。
 23. 对每个 finding 给出内部判定：FIX / IGNORE-DESIGN / IGNORE-NOISE / IGNORE-FALSE-POSITIVE / DEFER-BREAKING。Low/Medium 应明显偏向 IGNORE，除非现实安全影响和低风险修复都很明确。
-24. 然后直接编辑代码和/或 .strix-instructions.md。$([[ "$PI_FIX_DRY_RUN" == "true" ]] && echo '当前为 DRY RUN：不得修改任何文件，只做分析和输出建议。' || echo '当前不是 DRY RUN：可以直接修改必要文件。')
+24. 然后直接编辑代码和/或 .strix-instructions.md。$([[ "$PI_READ_ONLY" == "true" ]] && echo '当前为只读模式：不得修改任何文件，只做分析和输出建议。' || echo '当前不是只读模式：可以直接修改必要文件。')
 25. 最后输出一份完整 Markdown 总结到你的最终回答，必须包含：
    - 扫描项总数及各分类数量
    - 实际修复的问题（含文件和修复方式）
@@ -240,6 +275,9 @@ EOF_PROMPT
 pi_args=()
 if [[ "$PI_MODE" == "auto" ]]; then
   pi_args+=(-p)
+fi
+if [[ "$PI_READ_ONLY" == "true" ]]; then
+  pi_args+=(--tools "read,grep,find,ls")
 fi
 [[ -f "$LATEST_SARIF" ]] && pi_args+=("@$LATEST_SARIF")
 [[ -f "$REPORT_FILE" ]] && pi_args+=("@$REPORT_FILE")
@@ -290,6 +328,7 @@ if command -v git >/dev/null 2>&1 && git -C "$PROJECT_DIR" rev-parse --is-inside
     echo
     echo "# Staged diff"
     git -C "$PROJECT_DIR" diff --cached --no-ext-diff --binary || true
+    append_untracked_diffs "$PROJECT_DIR"
   } > "$DIFF_FILE"
 else
   : > "$STATUS_AFTER"

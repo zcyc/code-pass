@@ -114,7 +114,9 @@ PI_FIX_DRY_RUN=true ./run_pi.sh --auto /path/to/project \
 - `--interactive`：启动 Pi 交互界面，默认模式。
 - `--auto`：无交互运行，并将 Pi 输出保存到摘要文件。
 
-非 dry-run 模式下，Pi 可以修改项目中的必要文件。建议先使用 `PI_FIX_DRY_RUN=true` 查看分析结果，再检查实际修改内容。
+非 dry-run 且 `PI_FIX_ALLOW_BREAKING=true` 时，Pi 可以修改项目中的必要文件。`PI_FIX_DRY_RUN=true` 或 `PI_FIX_ALLOW_BREAKING=false` 都会启用 Pi 的只读工具白名单，禁止文件修改。
+
+Pi 修复结果默认写入独立目录 `~/pi_runs/<project>-<timestamp>-<pid>/`，不会写回 Strix 扫描结果目录。可通过 `PI_OUTPUT_DIR` 修改输出根目录。
 
 ## 常用环境变量
 
@@ -148,8 +150,9 @@ STRIX_MAX_BUDGET=30 \
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PI_BIN` | `pi` | Pi 可执行文件路径 |
+| `PI_OUTPUT_DIR` | `~/pi_runs` | Pi 修复结果输出根目录 |
 | `PI_FIX_DRY_RUN` | `false` | 设为 `true` 时只分析，不修改项目 |
-| `PI_FIX_ALLOW_BREAKING` | `true` | 是否允许为真实高危问题实施不可避免的破坏性修复 |
+| `PI_FIX_ALLOW_BREAKING` | `true` | `true` 允许写入；`false` 启用只读建议模式，禁止所有文件修改 |
 
 例如：
 
@@ -180,10 +183,10 @@ PI_FIX_ALLOW_BREAKING=false \
 
 ### Pi 修复结果
 
-Pi 的产物保存在选定扫描目录下的 `pi-fix-<timestamp>-<pid>/`：
+Pi 的产物保存在独立的 `~/pi_runs/<project>-<timestamp>-<pid>/` 目录：
 
 ```text
-<scan-result>/pi-fix-<id>/
+~/pi_runs/<project>-<timestamp>-<pid>/
 ├── prompt.md
 ├── pi-summary.md
 ├── changes.diff
@@ -203,9 +206,9 @@ Pi 的产物保存在选定扫描目录下的 `pi-fix-<timestamp>-<pid>/`：
 
 - `run_strix.sh` 不直接扫描原始项目，而是先复制到临时工作区，并移除 `.git`、依赖、构建产物、缓存、日志、二进制等非源代码内容。
 - 原始项目不会被 `run_strix.sh` 修改。
-- `run_pi.sh` 的非 dry-run 模式允许 Pi 修改指定项目；执行前应确认项目路径和扫描结果路径正确。
+- `run_pi.sh` 只有在非 dry-run 且 `PI_FIX_ALLOW_BREAKING=true` 时才允许 Pi 修改指定项目；执行前应确认项目路径和扫描结果路径正确。
 - 报告可能包含源码路径、漏洞证据和修复建议，应按敏感文件处理。
-- 不要把 `findings.sarif`、报告或 `pi-fix-*` 目录提交到不应包含审计结果的代码仓库。
+- 不要把 `findings.sarif`、报告或 `pi_runs/` 目录提交到不应包含审计结果的代码仓库。
 
 ## 退出码
 

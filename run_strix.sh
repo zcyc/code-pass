@@ -6,7 +6,7 @@ RUN_STRIX_PIPELINE_VERSION="3.3.2-local"
 usage() {
   cat <<'EOF'
 Usage:
-  run_strix_local.sh [--interactive|--auto] <local-project-dir> [quick|standard|deep]
+  run_strix.sh [--interactive|--auto] <local-project-dir> [quick|standard|deep]
 
 Modes:
   --interactive  Start the normal Strix TUI (default). Keeps a real terminal so
@@ -15,10 +15,10 @@ Modes:
                  transient transport retry behavior used by the old CI runner.
 
 Examples:
-  ./run_strix_local.sh ~/src/my-project
-  ./run_strix_local.sh ~/src/my-project standard
-  ./run_strix_local.sh --auto ~/src/my-project quick
-  STRIX_MAX_BUDGET=30 ./run_strix_local.sh --auto /opt/code/api deep
+  ./run_strix.sh ~/src/my-project
+  ./run_strix.sh ~/src/my-project standard
+  ./run_strix.sh --auto ~/src/my-project quick
+  STRIX_MAX_BUDGET=30 ./run_strix.sh --auto /opt/code/api deep
 
 Results are written to ~/strix_runs/<project>-<timestamp>-<pid>/ by default.
 Override the output root with STRIX_OUTPUT_DIR.
@@ -39,7 +39,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --version)
-      echo "run_strix_local ${RUN_STRIX_PIPELINE_VERSION}"
+      echo "run_strix ${RUN_STRIX_PIPELINE_VERSION}"
       exit 0
       ;;
     -h|--help)
@@ -95,14 +95,22 @@ readonly PROJECT_NAME
 STRIX_SCAN_MODE="${2:-${STRIX_SCAN_MODE:-quick}}"
 readonly STRIX_SCAN_MODE
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly SCRIPT_DIR
-readonly OUTPUT_ROOT="${STRIX_OUTPUT_DIR:-${HOME:?HOME is required}/strix_runs}"
+OUTPUT_ROOT="${STRIX_OUTPUT_DIR:-${HOME:?HOME is required}/strix_runs}"
+case "$OUTPUT_ROOT" in
+  /*) ;;
+  *) OUTPUT_ROOT="$(pwd -P)/$OUTPUT_ROOT" ;;
+esac
+readonly OUTPUT_ROOT
 RUN_ID="${STRIX_RUN_ID:-${PROJECT_NAME}-$(date '+%Y%m%d-%H%M%S')-$$}"
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "ERROR: invalid STRIX_RUN_ID: $RUN_ID" >&2; exit 1; }
 readonly RUN_ID
 readonly ARTIFACT_DIR="${OUTPUT_ROOT}/${RUN_ID}"
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/strix-local-${RUN_ID}.XXXXXX")"
+TMP_ROOT="${TMPDIR:-/tmp}"
+case "$TMP_ROOT" in
+  /*) ;;
+  *) TMP_ROOT="$(pwd -P)/$TMP_ROOT" ;;
+esac
+WORK_DIR="$(mktemp -d "${TMP_ROOT}/strix-local-${RUN_ID}.XXXXXX")"
 readonly WORK_DIR
 # Ensure early validation/copy failures do not leave a temporary source copy.
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -110,7 +118,11 @@ readonly TARGET_DIR="${WORK_DIR}/target"
 readonly STRIX_RUN_ROOT="${WORK_DIR}/strix_runs"
 
 _default_strix_bin="$(command -v strix 2>/dev/null || true)"
-readonly STRIX_BIN="${STRIX_BIN:-${_default_strix_bin:-${HOME}/.strix/bin/strix}}"
+_requested_strix_bin="${STRIX_BIN:-${_default_strix_bin:-${HOME}/.strix/bin/strix}}"
+if [[ "$_requested_strix_bin" != */* ]]; then
+  _requested_strix_bin="$(command -v "$_requested_strix_bin" 2>/dev/null || true)"
+fi
+readonly STRIX_BIN="$_requested_strix_bin"
 # Standalone implementation: all pipeline helper logic is embedded in this
 # launcher. Do not probe or depend on the old CI helper scripts.
 readonly PIPELINE_UTILS="${WORK_DIR}/strix_pipeline_utils_builtin.py"
@@ -185,13 +197,20 @@ def sarif_count(path: str):
         total += len(results)
     print(total)
 
-def retry_budget(run_root: str, remaining: str):
-    # Local standalone mode intentionally does not parse undocumented Strix
-    # billing internals. Retry count and the overall deadline remain bounded.
-    value = float(remaining)
-    if value <= 0:
-        raise ValueError('remaining budget must be positive')
-    print(('%f' % value).rstrip('0').rstrip('.'))
+def retry_budget(total: str, attempts: str):
+    # Strix does not expose authoritative local billing usage. Split the total
+    # budget across all possible attempts so retries cannot exceed the cap.
+    import math
+    value = float(total)
+    count = int(attempts)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError('total budget must be a finite positive number')
+    if count < 1:
+        raise ValueError('attempt count must be positive')
+    per_attempt = value / count
+    if per_attempt <= 0:
+        raise ValueError('per-attempt budget must be positive')
+    print(('%0.12f' % per_attempt).rstrip('0').rstrip('.'))
 
 def completed(run_dir: str):
     p = Path(run_dir) / 'run.json'
@@ -214,9 +233,7 @@ def completed(run_dir: str):
             if data[key]:
                 return
             raise ValueError(f'run {key}=false')
-    # If the schema has no recognized top-level completion marker, the caller
-    # still requires a co-located non-empty report and valid SARIF.
-    return
+    raise ValueError('run.json has no recognized completion marker')
 
 def main():
     if len(sys.argv) < 2:
@@ -473,9 +490,18 @@ sys.exit(rc)
 }
 
 
+if docker network inspect "$SANDBOX_NETWORK" >/dev/null 2>&1; then
+  die "Job-specific Docker network already exists: $SANDBOX_NETWORK"
+fi
+
 rm -rf "$WORK_DIR/target" "$STRIX_RUN_ROOT"
-mkdir -p "$TARGET_DIR" "$ARTIFACT_DIR"
-rm -f "$SCAN_LOG"
+mkdir -p "$TARGET_DIR" "$(dirname "$ARTIFACT_DIR")"
+
+# Reserve the output directory atomically. Reusing a run ID could merge stale
+# vulnerability details into a new report or delete another run's log.
+if ! mkdir "$ARTIFACT_DIR"; then
+  die "Output directory already exists or cannot be created: $ARTIFACT_DIR; choose a new STRIX_RUN_ID"
+fi
 
 echo "Copying local project into isolated scan workspace."
 cp -R -p "$SOURCE_DIR"/. "$TARGET_DIR"/
@@ -637,9 +663,6 @@ trap 'cancel_scan TERM 143' TERM
 trap 'cancel_scan INT 130' INT
 trap cleanup_all EXIT
 
-if docker network inspect "$SANDBOX_NETWORK" >/dev/null 2>&1; then
-  die "Job-specific Docker network already exists: $SANDBOX_NETWORK"
-fi
 network_active=1
 docker network create \
   --label "uk.kkpoker.strix-managed=true" \
@@ -680,9 +703,7 @@ echo "=========================================="
 source_args=(--target "$TARGET_DIR")
 echo "Source transfer: local sanitized copy via --target."
 cd "$WORK_DIR"
-set +e
 attempt=0
-remaining_budget="$STRIX_BUDGET"
 scan_deadline=$((SECONDS + STRIX_TIMEOUT_SECONDS))
 if [[ "$RUN_UI_MODE" == "interactive" ]]; then
   # A retry would tear down and recreate the user's TUI session. Keep the visual
@@ -691,6 +712,12 @@ if [[ "$RUN_UI_MODE" == "interactive" ]]; then
 else
   max_attempts=$((STRIX_NETWORK_RETRIES + 1))
 fi
+# A local retry cannot know how much Strix has already charged. Reserve an
+# equal slice for every possible attempt so the configured total remains a cap.
+attempt_budget="$(python3 "$PIPELINE_UTILS" retry-budget "$STRIX_BUDGET" "$max_attempts")" ||
+  die "Invalid STRIX_MAX_BUDGET: $STRIX_BUDGET"
+echo "Budget: total=$STRIX_BUDGET; per-attempt maximum=$attempt_budget"
+set +e
 while (( attempt < max_attempts )); do
   remaining_seconds=$((scan_deadline - SECONDS))
   if (( remaining_seconds <= 0 )); then
@@ -700,7 +727,7 @@ while (( attempt < max_attempts )); do
   fi
   attempt=$((attempt + 1))
   ATTEMPT_LOG="$ARTIFACT_DIR/attempt-${attempt}.log"
-  echo "Attempt $attempt: remaining_time=${remaining_seconds}s remaining_budget=$remaining_budget"
+  echo "Attempt $attempt: remaining_time=${remaining_seconds}s attempt_budget=$attempt_budget"
   scope_base="strix-local-${RUN_ID}-attempt-${attempt}"
   scope_unit="${scope_base}.scope"
   printf '\n=== Strix attempt %d/%d ===\n' "$attempt" "$max_attempts" | tee -a "$SCAN_LOG"
@@ -713,7 +740,7 @@ while (( attempt < max_attempts )); do
     "${source_args[@]}"
     --scan-mode "$STRIX_SCAN_MODE"
     --scope-mode full
-    --max-budget "$remaining_budget"
+    --max-budget "$attempt_budget"
     --max-turns "$STRIX_MAX_TURNS"
     --instruction "$COMBINED_INSTRUCTION"
   )
@@ -783,10 +810,6 @@ while (( attempt < max_attempts )); do
   fi
   if [[ "$strix_exit" -ne 0 && "$strix_exit" -ne 124 && "$strix_exit" -ne 130 && "$strix_exit" -ne 143 &&
         "$log_write_error" -eq 0 && "$attempt" -lt "$max_attempts" && -n "$retry_reason" ]]; then
-    if ! next_budget="$(python3 "$PIPELINE_UTILS" retry-budget "$STRIX_RUN_ROOT" "$remaining_budget")"; then
-      echo "Cannot safely account for retry budget; preserving failed attempt." >&2
-      break
-    fi
     if (( scan_deadline - SECONDS <= 0 )); then
       break
     fi
@@ -798,14 +821,13 @@ while (( attempt < max_attempts )); do
     if [[ -d "$TARGET_DIR/strix_runs" ]]; then
       mv "$TARGET_DIR/strix_runs" "$archive/target-strix_runs" || break
     fi
-    remaining_budget="$next_budget"
     cleanup_sandbox
     network_active=1
     if ! docker network create --label "uk.kkpoker.strix-managed=true" \
       --label "uk.kkpoker.strix-run-id=${RUN_ID}" "$SANDBOX_NETWORK" >/dev/null; then
       break
     fi
-    echo "NOTICE: Retrying transport failure within remaining job time/budget; previous state preserved." | tee -a "$SCAN_LOG"
+    echo "NOTICE: Retrying transport failure within reserved total time/budget; previous state preserved." | tee -a "$SCAN_LOG"
     continue
   fi
   break
