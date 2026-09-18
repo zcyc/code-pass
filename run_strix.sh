@@ -65,7 +65,8 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-set -- "${_positional[@]}"
+# Bash < 4.4 treats "${arr[@]}" on a set-but-empty array as unbound under set -u.
+set -- ${_positional[@]+"${_positional[@]}"}
 unset _positional
 
 case "$RUN_UI_MODE" in
@@ -244,14 +245,20 @@ def sarif_count(path: str):
     if not isinstance(data, dict) or not isinstance(data.get('runs'), list):
         raise ValueError('invalid SARIF: missing runs array')
     total = 0
+    coverage = 0
     for run in data['runs']:
         if not isinstance(run, dict):
             raise ValueError('invalid SARIF run')
         results = run.get('results', [])
         if not isinstance(results, list):
             raise ValueError('invalid SARIF results')
-        total += len(results)
-    print(total)
+        for result in results:
+            total += 1
+            if isinstance(result, dict):
+                rule = result.get('ruleId')
+                if isinstance(rule, str) and rule.startswith('strix-coverage/'):
+                    coverage += 1
+    print(f'{total} {coverage}')
 
 def retry_budget(total: str, attempts: str):
     # Strix does not expose authoritative local billing usage. Split the total
@@ -276,20 +283,33 @@ def completed(run_dir: str):
         data = json.load(f)
     if not isinstance(data, dict):
         raise ValueError('run.json is not an object')
+    completed_marker = False
     for key in ('status', 'state'):
         val = data.get(key)
         if isinstance(val, str):
             low = val.lower()
             if low in {'completed', 'complete', 'finished', 'success', 'succeeded', 'done'}:
-                return
+                completed_marker = True
+                break
             if low in {'failed', 'failure', 'error', 'cancelled', 'canceled', 'running', 'pending'}:
                 raise ValueError(f'run {key}={val}')
-    for key in ('completed', 'is_completed', 'finished'):
-        if key in data and isinstance(data[key], bool):
-            if data[key]:
-                return
-            raise ValueError(f'run {key}=false')
-    raise ValueError('run.json has no recognized completion marker')
+    if not completed_marker:
+        for key in ('completed', 'is_completed', 'finished'):
+            if key in data and isinstance(data[key], bool):
+                if not data[key]:
+                    raise ValueError(f'run {key}=false')
+                completed_marker = True
+                break
+    if not completed_marker:
+        raise ValueError('run.json has no recognized completion marker')
+    # Strix records the authoritative scan outcome here; honor it even when the
+    # run itself shut down cleanly.
+    scan_results = data.get('scan_results')
+    if isinstance(scan_results, dict):
+        if scan_results.get('scan_completed') is False:
+            raise ValueError('run.json scan_results.scan_completed=false')
+        if scan_results.get('success') is False:
+            raise ValueError('run.json scan_results.success=false')
 
 def main():
     if len(sys.argv) < 2:
@@ -646,6 +666,9 @@ scope_base="strix-local-${RUN_ID}"
 scope_unit="${scope_base}.scope"
 scope_active=0
 network_active=0
+# Set once every artifact is safely in the output directory; until then the
+# scan workspace is never deleted, so a crash cannot cost the scan results.
+artifacts_saved=0
 
 cleanup_scope() {
   if [[ "$USE_SYSTEMD_SCOPE" -ne 1 || "$scope_active" -ne 1 ]]; then
@@ -728,6 +751,10 @@ cleanup_workspace() {
     echo "Keeping local scan workspace: $WORK_DIR" >&2
     return
   fi
+  if [[ "$artifacts_saved" -ne 1 && ( -d "$TARGET_DIR/strix_runs" || -d "$STRIX_RUN_ROOT" ) ]]; then
+    echo "Scan results were not finalized; keeping local scan workspace for recovery: $WORK_DIR" >&2
+    return
+  fi
   rm -rf "$WORK_DIR"
 }
 
@@ -768,6 +795,7 @@ echo "Starting standalone Strix scan"
 echo "Source directory: $SOURCE_DIR"
 echo "Source revision: $SOURCE_REVISION"
 echo "Output directory: $ARTIFACT_DIR"
+echo "Scan workspace: $WORK_DIR"
 echo "Scan mode: $STRIX_SCAN_MODE"
 if [[ "$RUN_UI_MODE" == "interactive" ]]; then
   echo "Interface: Strix interactive TUI"
@@ -847,7 +875,7 @@ while (( attempt < max_attempts )); do
     # remain attached to the real terminal. We still leave a small attempt log
     # so downstream validation has a stable file to inspect.
     {
-      echo "Interactive Strix TUI run; terminal output was not captured to preserve TTY behavior."
+      echo "Interactive Strix TUI run; terminal output was not captured to preserve TTY behavior (Strix's own strix.log is copied to the result directory when the run completes)."
       echo "Started: $(date '+%Y-%m-%d %H:%M:%S %z')"
       echo "Source directory: $SOURCE_DIR"
       echo "Scan mode: $STRIX_SCAN_MODE"
@@ -876,12 +904,16 @@ while (( attempt < max_attempts )); do
   cleanup_scope
 
   retry_reason=""
-  # Model refusals are terminal. Only headless mode has a captured console log,
-  # so transport-error retries are intentionally limited to --auto.
+  # Model refusals are terminal. Only headless mode retries, but both the
+  # console log and Strix's own log are consulted for transport failures.
   if [[ "$RUN_UI_MODE" == "auto" ]] && ! grep -Fq 'This content was flagged for possible cybersecurity risk' "$ATTEMPT_LOG"; then
+    retry_logs=("$ATTEMPT_LOG")
+    while IFS= read -r -d '' strix_log_path; do
+      retry_logs[${#retry_logs[@]}]="$strix_log_path"
+    done < <(find "$TARGET_DIR/strix_runs" "$STRIX_RUN_ROOT" -type f -name strix.log -print0 2>/dev/null)
     if grep -Eq \
       'httpx\.(ReadTimeout|ConnectTimeout|RemoteProtocolError)|httpcore\.(ReadTimeout|ConnectTimeout|RemoteProtocolError)|openai\.(APITimeoutError|APIConnectionError)' \
-      "$ATTEMPT_LOG"; then
+      "${retry_logs[@]}"; then
       retry_reason="transient model API transport timeout"
     fi
   fi
@@ -933,16 +965,55 @@ done < <(
     -type f -name penetration_test_report.md -print0 2>/dev/null
 )
 
+# Copy the raw Strix outputs into the artifact directory before validation:
+# a later failure (or an edit to this script while it is running) must never
+# cost the scan results.
+copy_run_artifacts() {
+  local source_run_dir="$1"
+  cp "$source_run_dir/findings.sarif" "$ARTIFACT_DIR/findings.sarif"
+  local extra
+  for extra in run.json strix.log; do
+    if [[ -f "$source_run_dir/$extra" && ! -L "$source_run_dir/$extra" ]]; then
+      cp "$source_run_dir/$extra" "$ARTIFACT_DIR/$extra"
+    fi
+  done
+  if [[ -f "$source_run_dir/vulnerabilities.csv" && ! -L "$source_run_dir/vulnerabilities.csv" ]]; then
+    cp "$source_run_dir/vulnerabilities.csv" "$ARTIFACT_DIR/vulnerabilities.csv"
+  else
+    echo "NOTICE: Strix did not produce vulnerabilities.csv." >&2
+  fi
+  if [[ -d "$source_run_dir/vulnerabilities" && ! -L "$source_run_dir/vulnerabilities" ]]; then
+    cp -R -P -p "$source_run_dir/vulnerabilities" "$ARTIFACT_DIR/vulnerabilities"
+  else
+    echo "NOTICE: Strix did not produce a vulnerabilities directory." >&2
+  fi
+}
+
+if [[ "${#sarif_files[@]}" -eq 1 ]]; then
+  copy_run_artifacts "$(dirname "${sarif_files[0]}")"
+fi
+if [[ "${#report_files[@]}" -eq 1 ]]; then
+  cp "${report_files[0]}" "$ARTIFACT_DIR/penetration_test_report.md"
+fi
+
 result_count=0
+coverage_count=0
+findings_count=0
 scan_status="failure"
 sarif_valid=0
 sarif_source=""
+run_dir=""
 if [[ "${#sarif_files[@]}" -eq 1 ]]; then
   sarif_source="${sarif_files[0]}"
-  if result_count="$(python3 "$PIPELINE_UTILS" sarif-count "$sarif_source")"; then
+  run_dir="$(dirname "$sarif_source")"
+  if sarif_counts="$(python3 "$PIPELINE_UTILS" sarif-count "$sarif_source")"; then
+    read -r result_count coverage_count <<< "$sarif_counts"
+    findings_count=$((result_count - coverage_count))
     sarif_valid=1
   else
     result_count=0
+    coverage_count=0
+    findings_count=0
     echo "findings.sarif is not valid JSON/SARIF." >&2
   fi
 else
@@ -959,28 +1030,36 @@ if [[ "${#sarif_files[@]}" -eq 1 && "${#report_files[@]}" -eq 1 ]] && \
   same_run_dir=1
 fi
 
+# Prefer Strix's own run log when it exists: it is written for interactive and
+# headless runs alike, while the TUI console transcript is intentionally not
+# captured. Both logs are scanned when available.
+diagnostic_logs=("$FINAL_SCAN_LOG")
+if [[ -n "$run_dir" && -f "$run_dir/strix.log" && ! -L "$run_dir/strix.log" ]]; then
+  diagnostic_logs+=("$run_dir/strix.log")
+fi
+
 context_error=0
-if [[ "$RUN_UI_MODE" == "auto" && "$STRIX_FAIL_ON_CONTEXT_ERROR" == "true" ]] && \
-   grep -Eiq 'context window|ContextWindowExceeded|prompt is too long|input exceeds the context window' "$FINAL_SCAN_LOG"; then
+if [[ "$STRIX_FAIL_ON_CONTEXT_ERROR" == "true" ]] && \
+   grep -Eiq 'context window|ContextWindowExceeded|prompt is too long|input exceeds the context window' "${diagnostic_logs[@]}"; then
   context_error=1
   echo "Detected a fatal model context-window error; this scan is incomplete." >&2
 fi
 
 runtime_error=${log_write_error:-0}
-if [[ "$RUN_UI_MODE" == "auto" ]] && grep -Eiq \
+if grep -Eiq \
   'Strix lifecycle recovery exhausted|Too many open files|unable to open database file|render_system_prompt failed; returning empty prompt|Prepared model input is empty|proactive compaction failed' \
-  "$FINAL_SCAN_LOG"; then
+  "${diagnostic_logs[@]}"; then
   runtime_error=1
   echo "Detected a fatal Strix runtime/resource error; this scan is incomplete." >&2
-elif [[ "$RUN_UI_MODE" == "auto" && "$strix_exit" -ne 0 ]] && grep -Eq \
+elif [[ "$strix_exit" -ne 0 ]] && grep -Eq \
   'httpx\.(ReadTimeout|ConnectTimeout|RemoteProtocolError)|httpcore\.(ReadTimeout|ConnectTimeout|RemoteProtocolError)|openai\.(APITimeoutError|APIConnectionError)' \
-  "$FINAL_SCAN_LOG"; then
+  "${diagnostic_logs[@]}"; then
   runtime_error=1
   echo "Detected a fatal model API transport error after ${attempt} attempt(s); this scan is incomplete." >&2
 fi
 
 content_filter_error=0
-if [[ "$RUN_UI_MODE" == "auto" ]] && grep -Fq 'This content was flagged for possible cybersecurity risk' "$FINAL_SCAN_LOG"; then
+if grep -Fq 'This content was flagged for possible cybersecurity risk' "${diagnostic_logs[@]}"; then
   content_filter_error=1
   if [[ "$strix_exit" -ne 0 ]]; then
     echo "Detected a fatal model cybersecurity content-filter interruption after ${attempt} attempt(s)." >&2
@@ -1007,30 +1086,8 @@ elif [[ "$run_completed" -eq 1 && "$context_error" -eq 0 && "$runtime_error" -eq
   scan_status="success"
 fi
 
-# Preserve all usable partial outputs even when the operational status is
-# failure. Local artifacts remain under ~/strix_runs/<run-id>/ by default.
-# SCAN_LOG is written directly into the local run artifact directory.
-
-if [[ "$sarif_valid" -eq 1 && -n "$sarif_source" ]]; then
-  run_dir="$(dirname "$sarif_source")"
-  cp "$sarif_source" "$ARTIFACT_DIR/findings.sarif"
-
-  if [[ -f "$run_dir/vulnerabilities.csv" && ! -L "$run_dir/vulnerabilities.csv" ]]; then
-    cp "$run_dir/vulnerabilities.csv" "$ARTIFACT_DIR/vulnerabilities.csv"
-  else
-    echo "NOTICE: Strix did not produce vulnerabilities.csv." >&2
-  fi
-
-  if [[ -d "$run_dir/vulnerabilities" && ! -L "$run_dir/vulnerabilities" ]]; then
-    cp -R -P -p "$run_dir/vulnerabilities" "$ARTIFACT_DIR/vulnerabilities"
-  else
-    echo "NOTICE: Strix did not produce a vulnerabilities directory." >&2
-  fi
-fi
-
-if [[ "${#report_files[@]}" -eq 1 ]]; then
-  cp "${report_files[0]}" "$ARTIFACT_DIR/penetration_test_report.md"
-fi
+# Artifacts were inserted at the top of this section, before validation; the
+# placeholder logic below only fills gaps for scans that produced no files.
 
 # Keep a stable local artifact layout. A clean scan with zero findings may not
 # produce CSV/detail paths, so create placeholders that explicitly describe the
@@ -1041,7 +1098,7 @@ if [[ ! -f "$ARTIFACT_DIR/vulnerabilities.csv" ]]; then
 fi
 if [[ ! -d "$ARTIFACT_DIR/vulnerabilities" ]]; then
   mkdir -p "$ARTIFACT_DIR/vulnerabilities"
-  if [[ "$scan_status" == "success" && "$result_count" -eq 0 ]]; then
+  if [[ "$scan_status" == "success" && "$findings_count" -eq 0 ]]; then
     echo "Scan completed; no vulnerabilities reported." > "$ARTIFACT_DIR/vulnerabilities/README.txt"
   else
     echo "Scan incomplete or detailed findings unavailable. Do not interpret missing results as no vulnerabilities." > "$ARTIFACT_DIR/vulnerabilities/README.txt"
@@ -1049,10 +1106,12 @@ if [[ ! -d "$ARTIFACT_DIR/vulnerabilities" ]]; then
   echo "NOTICE: created vulnerability artifact status placeholder." >&2
 fi
 
-printf "status=%s\nexit_code=%s\nfindings=%s\n" "$scan_status" "$strix_exit" "$result_count" > "$ARTIFACT_DIR/scan-status.txt"
+printf "status=%s\nexit_code=%s\nfindings=%s\ncoverage=%s\ntotal_results=%s\n" \
+  "$scan_status" "$strix_exit" "$findings_count" "$coverage_count" "$result_count" > "$ARTIFACT_DIR/scan-status.txt"
+artifacts_saved=1
 
 echo "Strix native exit code: $strix_exit"
-echo "SARIF finding count: $result_count"
+echo "SARIF findings: $findings_count (coverage checks: $coverage_count, total results: $result_count)"
 echo "Normalized scan status: $scan_status"
 
 if [[ "$scan_status" != "success" ]]; then
@@ -1063,5 +1122,5 @@ fi
 echo "Strix scan completed normally."
 echo "Results: $ARTIFACT_DIR"
 if [[ "$RUN_UI_MODE" == "interactive" ]]; then
-  echo "NOTE: interactive TUI output is intentionally not captured in strix-console.log; use --auto when a complete console log is required."
+  echo "NOTE: the interactive TUI transcript is not captured in strix-console.log; Strix's own strix.log and run.json are preserved in the result directory for diagnostics."
 fi

@@ -135,7 +135,7 @@ Pi 修复结果默认写入独立目录 `~/pi_runs/<project>-<timestamp>-<pid>/`
 | `STRIX_TIMEOUT` | `9h30m` | 总扫描超时时间，如 `30m`、`3600s` |
 | `STRIX_MAX_TURNS` | 按扫描模式设置 | 每个 agent 的最大轮数 |
 | `STRIX_NETWORK_RETRIES` | `1` | 无交互模式下的临时网络错误重试次数，范围 `0-2` |
-| `STRIX_KEEP_WORKSPACE` | `false` | 设为 `true` 时保留临时扫描工作区 |
+| `STRIX_KEEP_WORKSPACE` | `false` | 设为 `true` 时保留临时扫描工作区；默认情况下若结果未能写入输出目录，也会自动保留并打印恢复路径 |
 | `STRIX_FRONTEND_STATIC` | `false` | 设为 `true` 时强制纯静态审计 |
 
 例如：
@@ -155,7 +155,7 @@ STRIX_MAX_BUDGET=30 \
 | `PI_OUTPUT_DIR` | `~/pi_runs` | Pi 修复结果输出根目录 |
 | `PI_FIX_DRY_RUN` | `false` | 设为 `true` 时只分析，不修改项目 |
 | `PI_FIX_ALLOW_BREAKING` | `true` | `true` 允许写入；`false` 启用只读建议模式，禁止所有文件修改 |
-| `PI_TIMEOUT` | `9h30m` | Pi 总超时时间，如 `30m`、`3600s` |
+| `PI_TIMEOUT` | 未设置 | 可选，设置后为 Pi 增加总超时，如 `30m`、`2h`、`3600s`；不设置则不限时 |
 
 例如：
 
@@ -177,12 +177,23 @@ PI_FIX_ALLOW_BREAKING=false \
 ├── penetration_test_report.md
 ├── vulnerabilities.csv
 ├── vulnerabilities/
+├── run.json
+├── strix.log
 ├── scan-status.txt
 ├── strix-console.log
 └── attempt-<n>.log
 ```
 
-`scan-status.txt` 中的 `status=success` 表示脚本完成了报告、SARIF、运行状态和运行时错误校验。扫描失败或不完整时，脚本仍会尽量保留可用的部分结果。
+`scan-status.txt` 中的 `status=success` 表示脚本完成了报告、SARIF、运行状态和运行时错误校验：
+
+- `findings` 只统计真实发现，`coverage` 是 `strix-coverage/*` 覆盖项数量，`total_results` 是全部 SARIF result 数。
+- 运行时错误校验优先读取 Strix 自带的 `strix.log`，interactive 和 `--auto` 模式都会执行；`run.json` 中的 `scan_results.scan_completed` / `success` 也会参与完成度判定（字段存在时）。
+- interactive TUI 的终端输出不会写进 `strix-console.log`；需要完整控制台日志时使用 `--auto`。
+- `run.json` 和 `strix.log` 会随结果一起复制出来，便于事后核对扫描完成度、批次中断和成本。
+
+扫描失败或不完整时，脚本仍会尽量保留可用的部分结果：Strix 的原始输出会在校验之前先复制到结果目录；如果连这一步都没来得及完成（脚本崩溃、被中断等），临时工作区不会被删掉，而会打印 `keeping local scan workspace for recovery: <path>`，可手动从该目录取回结果。
+
+注意：不要在扫描运行期间修改或升级 `run_strix.sh` 本身。bash 是边执行边从脚本文件读取的，运行中修改文件会使后续读取错位并中断脚本（结果虽然可由上面的恢复机制找回，但本次扫描需要重跑）。
 
 ### Pi 修复结果
 

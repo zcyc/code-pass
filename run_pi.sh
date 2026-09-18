@@ -38,7 +38,8 @@ Environment variables:
   PI_FIX_ALLOW_BREAKING  true => allow file edits, including unavoidable
                          breaking fixes, for verified High/Critical issues.
                          Default true. Set false for a read-only run.
-  PI_TIMEOUT             total Pi timeout. Default: 9h30m
+  PI_TIMEOUT             optional total Pi timeout, e.g. 30m, 2h, 3600s.
+                         Unset by default: Pi runs without a script timeout.
 
 Examples:
   ./run_pi.sh ~/src/my-project ~/strix_runs/my-project_0f73
@@ -137,10 +138,35 @@ readonly PI_BIN
 
 PI_FIX_DRY_RUN="${PI_FIX_DRY_RUN:-false}"
 PI_FIX_ALLOW_BREAKING="${PI_FIX_ALLOW_BREAKING:-true}"
-readonly PI_TIMEOUT="${PI_TIMEOUT:-9h30m}"
 
 case "$PI_FIX_DRY_RUN" in true|false) ;; *) die "PI_FIX_DRY_RUN must be true or false" ;; esac
 case "$PI_FIX_ALLOW_BREAKING" in true|false) ;; *) die "PI_FIX_ALLOW_BREAKING must be true or false" ;; esac
+
+PI_TIMEOUT="${PI_TIMEOUT:-}"
+PI_TIMEOUT_SECONDS=""
+if [[ -n "$PI_TIMEOUT" ]]; then
+  PI_TIMEOUT_SECONDS="$(python3 - "$PI_TIMEOUT" <<'PY'
+import re
+import sys
+
+raw = sys.argv[1].strip()
+if re.fullmatch(r"\d+(\.\d+)?", raw):
+    print(int(float(raw)))
+    raise SystemExit
+units = {"h": 3600, "m": 60, "s": 1}
+total = 0.0
+matched = False
+for number, unit in re.findall(r"(\d+(?:\.\d+)?)([hms])", raw):
+    total += float(number) * units[unit]
+    matched = True
+if not matched or re.sub(r"\d+(?:\.\d+)?[hms]", "", raw):
+    raise SystemExit(1)
+print(int(total))
+PY
+)" || die "invalid PI_TIMEOUT: $PI_TIMEOUT (use forms like 30m, 2h, 3600s)"
+  [[ "$PI_TIMEOUT_SECONDS" -gt 0 ]] || die "PI_TIMEOUT must be positive"
+fi
+readonly PI_TIMEOUT PI_TIMEOUT_SECONDS
 
 PI_READ_ONLY="false"
 if [[ "$PI_FIX_DRY_RUN" == "true" || "$PI_FIX_ALLOW_BREAKING" == "false" ]]; then
@@ -169,28 +195,6 @@ print(Path(os.path.abspath(sys.argv[1])).resolve(strict=False))
 PY
 }
 
-PI_TIMEOUT_SECONDS="$(python3 - "$PI_TIMEOUT" <<'PY'
-import re
-import sys
-
-raw = sys.argv[1].strip()
-if re.fullmatch(r"\d+(\.\d+)?", raw):
-    print(int(float(raw)))
-    raise SystemExit
-units = {"h": 3600, "m": 60, "s": 1}
-total = 0.0
-matched = False
-for number, unit in re.findall(r"(\d+(?:\.\d+)?)([hms])", raw):
-    total += float(number) * units[unit]
-    matched = True
-if not matched or re.sub(r"\d+(?:\.\d+)?[hms]", "", raw):
-    raise SystemExit(1)
-print(int(total))
-PY
-)" || die "invalid PI_TIMEOUT: $PI_TIMEOUT (use forms like 9h30m, 9h, 570m, 34200s)"
-[[ "$PI_TIMEOUT_SECONDS" -gt 0 ]] || die "PI_TIMEOUT must be positive"
-readonly PI_TIMEOUT_SECONDS
-
 PI_OUTPUT_ROOT="${PI_OUTPUT_DIR:-${HOME:?HOME is required}/pi_runs}"
 PI_OUTPUT_ROOT="$(canonicalize_path "$PI_OUTPUT_ROOT")" ||
   die "cannot resolve Pi output root: ${PI_OUTPUT_DIR:-$PI_OUTPUT_ROOT}"
@@ -208,7 +212,7 @@ esac
 readonly PI_OUTPUT_ROOT
 
 if [[ -f "$STATUS_FILE" && ! -L "$STATUS_FILE" ]]; then
-  scan_status="$(sed -n 's/^status=//p' "$STATUS_FILE" | head -n1)"
+  scan_status="$(sed -n 's/^status=//p' "$STATUS_FILE" | head -n1 | tr -d '\r')"
   if [[ -n "$scan_status" && "$scan_status" != "success" ]]; then
     echo "WARNING: selected scan status is '$scan_status'; findings may be incomplete." >&2
   fi
@@ -227,17 +231,29 @@ STATUS_AFTER="$FIX_DIR/git-status-after.txt"
 DIFF_FILE="$FIX_DIR/changes.diff"
 META_FILE="$FIX_DIR/metadata.txt"
 
+# Build a tree object from the current worktree without touching the user's
+# real index, so the change diff never depends on concurrent edits or hooks.
+index_tree() {
+  local index_file="$1"
+  if git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+    GIT_INDEX_FILE="$index_file" git -C "$PROJECT_DIR" read-tree HEAD || return 1
+  else
+    GIT_INDEX_FILE="$index_file" git -C "$PROJECT_DIR" read-tree --empty || return 1
+  fi
+  GIT_INDEX_FILE="$index_file" git -C "$PROJECT_DIR" add -A -- . || return 1
+  GIT_INDEX_FILE="$index_file" git -C "$PROJECT_DIR" write-tree
+}
+
 if command -v git >/dev/null 2>&1 && git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git -C "$PROJECT_DIR" status --short --untracked-files=all > "$STATUS_BEFORE" || true
   BASE_REV="$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
   BASELINE_INDEX="$FIX_DIR/git-index-before"
-  if git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
-    GIT_INDEX_FILE="$BASELINE_INDEX" git -C "$PROJECT_DIR" read-tree HEAD
+  if BASELINE_TREE="$(index_tree "$BASELINE_INDEX")"; then
+    :
   else
-    GIT_INDEX_FILE="$BASELINE_INDEX" git -C "$PROJECT_DIR" read-tree --empty
+    BASELINE_TREE=""
+    echo "WARNING: failed to index the pre-run working tree; the change diff will be unavailable." >&2
   fi
-  GIT_INDEX_FILE="$BASELINE_INDEX" git -C "$PROJECT_DIR" add -A -- .
-  BASELINE_TREE="$(GIT_INDEX_FILE="$BASELINE_INDEX" git -C "$PROJECT_DIR" write-tree)"
 else
   BASE_REV="not-a-git-repository"
   BASELINE_TREE=""
@@ -256,8 +272,8 @@ dry_run=$PI_FIX_DRY_RUN
 allow_breaking=$PI_FIX_ALLOW_BREAKING
 read_only=$PI_READ_ONLY
 mode=$PI_MODE
+timeout=${PI_TIMEOUT:-unset}
 started_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
-timeout=$PI_TIMEOUT
 EOF_META
 
 # shellcheck disable=SC1111
@@ -334,9 +350,14 @@ fi
 [[ -f "$REPORT_FILE" && ! -L "$REPORT_FILE" ]] && pi_args+=("@$REPORT_FILE")
 pi_args+=("$(cat "$PROMPT_FILE")")
 
-run_pi_with_timeout() {
-  local seconds="$1"
-  shift
+# PI_TIMEOUT is opt-in: when unset, Pi runs directly with no script-level
+# deadline. When set, wrap Pi with a portable timeout that forwards signals and
+# works on macOS without GNU coreutils.
+run_pi_bin() {
+  if [[ -z "$PI_TIMEOUT_SECONDS" ]]; then
+    "$PI_BIN" "$@"
+    return
+  fi
   python3 -c '
 import os, signal, subprocess, sys
 seconds = float(sys.argv[1])
@@ -371,7 +392,7 @@ except subprocess.TimeoutExpired:
 if rc < 0:
     sys.exit(128 + (-rc))
 sys.exit(rc)
-' "$seconds" "$PI_MODE" "$@"
+' "$PI_TIMEOUT_SECONDS" "$PI_MODE" "$PI_BIN" "$@"
 }
 
 echo "=========================================="
@@ -383,14 +404,13 @@ echo "Output:     $FIX_DIR"
 echo "Mode:       $PI_MODE"
 echo "Dry run:    $PI_FIX_DRY_RUN"
 echo "Breaking:   $PI_FIX_ALLOW_BREAKING"
-echo "Timeout:    $PI_TIMEOUT"
 echo "=========================================="
 
 set +e
 if [[ "$PI_MODE" == "auto" ]]; then
   (
     cd "$PROJECT_DIR"
-    run_pi_with_timeout "$PI_TIMEOUT_SECONDS" "$PI_BIN" "${pi_args[@]}"
+    run_pi_bin "${pi_args[@]}"
   ) 2>&1 | tee "$SUMMARY_FILE"
   pipeline_status=("${PIPESTATUS[@]}")
   pi_status="${pipeline_status[0]}"
@@ -411,7 +431,7 @@ EOF_SUMMARY
   (
     cd "$PROJECT_DIR"
     echo "Entering Pi interactive session..."
-    run_pi_with_timeout "$PI_TIMEOUT_SECONDS" "$PI_BIN" "${pi_args[@]}"
+    run_pi_bin "${pi_args[@]}"
   )
   pi_status=$?
 fi
@@ -420,15 +440,16 @@ set -e
 if command -v git >/dev/null 2>&1 && git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git -C "$PROJECT_DIR" status --short --untracked-files=all > "$STATUS_AFTER" || true
   AFTER_INDEX="$FIX_DIR/git-index-after"
-  if git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
-    GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" read-tree HEAD
+  if [[ -z "$BASELINE_TREE" ]]; then
+    printf '%s\n' '# Baseline diff unavailable; inspect git-status-before.txt and git-status-after.txt.' > "$DIFF_FILE"
+  elif index_tree "$AFTER_INDEX" >/dev/null; then
+    if ! GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" diff \
+      --cached --no-ext-diff --binary "$BASELINE_TREE" -- > "$DIFF_FILE"; then
+      echo "WARNING: failed to generate the Pi change diff." >&2
+      printf '%s\n' '# Unable to generate the Pi change diff; inspect git-status-after.txt.' > "$DIFF_FILE"
+    fi
   else
-    GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" read-tree --empty
-  fi
-  GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" add -A -- .
-  if ! GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" diff \
-    --cached --no-ext-diff --binary "$BASELINE_TREE" -- > "$DIFF_FILE"; then
-    echo "WARNING: failed to generate the Pi change diff." >&2
+    echo "WARNING: failed to index the post-run working tree; the change diff will be unavailable." >&2
     printf '%s\n' '# Unable to generate the Pi change diff; inspect git-status-after.txt.' > "$DIFF_FILE"
   fi
   rm -f "$BASELINE_INDEX" "$AFTER_INDEX"
