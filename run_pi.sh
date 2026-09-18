@@ -117,13 +117,19 @@ else
   die "Strix scan result path does not exist: $SCAN_ARG"
 fi
 
-[[ -f "$LATEST_SARIF" ]] || die "findings.sarif not found in selected scan result: $SCAN_DIR"
+[[ -f "$LATEST_SARIF" && ! -L "$LATEST_SARIF" ]] ||
+  die "findings.sarif must be a regular file in the selected scan result: $SCAN_DIR"
 [[ -s "$LATEST_SARIF" ]] || die "selected findings.sarif is empty: $LATEST_SARIF"
 readonly SCAN_DIR LATEST_SARIF
 
 PI_BIN="${PI_BIN:-$(command -v pi 2>/dev/null || true)}"
 if [[ "$PI_BIN" != */* ]]; then
   PI_BIN="$(command -v "$PI_BIN" 2>/dev/null || true)"
+fi
+if [[ -n "$PI_BIN" && "$PI_BIN" != /* ]]; then
+  PI_BIN="$(cd "$(dirname "$PI_BIN")" 2>/dev/null &&
+    printf '%s/%s\n' "$(pwd -P)" "$(basename "$PI_BIN")")" ||
+    die "cannot resolve pi executable: $PI_BIN"
 fi
 [[ -n "$PI_BIN" && -x "$PI_BIN" ]] || die "pi executable not found; set PI_BIN or install pi"
 readonly PI_BIN
@@ -155,16 +161,18 @@ case "$PI_OUTPUT_ROOT" in
 esac
 case "$PI_OUTPUT_ROOT/" in
   "$PROJECT_DIR/"*) die "PI_OUTPUT_DIR must be outside the project directory: $PI_OUTPUT_ROOT" ;;
+  "$SCAN_DIR/"*) die "PI_OUTPUT_DIR must be outside the selected Strix scan result: $PI_OUTPUT_ROOT" ;;
 esac
 mkdir -p "$PI_OUTPUT_ROOT" || die "cannot create Pi output root: $PI_OUTPUT_ROOT"
 PI_OUTPUT_ROOT="$(cd "$PI_OUTPUT_ROOT" 2>/dev/null && pwd -P)" ||
   die "cannot resolve Pi output root: $PI_OUTPUT_ROOT"
 case "$PI_OUTPUT_ROOT/" in
   "$PROJECT_DIR/"*) die "PI_OUTPUT_DIR must be outside the project directory: $PI_OUTPUT_ROOT" ;;
+  "$SCAN_DIR/"*) die "PI_OUTPUT_DIR must be outside the selected Strix scan result: $PI_OUTPUT_ROOT" ;;
 esac
 readonly PI_OUTPUT_ROOT
 
-if [[ -f "$STATUS_FILE" ]]; then
+if [[ -f "$STATUS_FILE" && ! -L "$STATUS_FILE" ]]; then
   scan_status="$(sed -n 's/^status=//p' "$STATUS_FILE" | head -n1)"
   if [[ -n "$scan_status" && "$scan_status" != "success" ]]; then
     echo "WARNING: selected scan status is '$scan_status'; findings may be incomplete." >&2
@@ -199,6 +207,7 @@ else
   BASE_REV="not-a-git-repository"
   BASELINE_TREE=""
   : > "$STATUS_BEFORE"
+  echo "WARNING: Git worktree not detected; status and change tracking will be unavailable." >&2
 fi
 
 cat > "$META_FILE" <<EOF_META
@@ -285,8 +294,8 @@ fi
 if [[ "$PI_READ_ONLY" == "true" ]]; then
   pi_args+=(--tools "read,grep,find,ls")
 fi
-[[ -f "$LATEST_SARIF" ]] && pi_args+=("@$LATEST_SARIF")
-[[ -f "$REPORT_FILE" ]] && pi_args+=("@$REPORT_FILE")
+[[ -f "$LATEST_SARIF" && ! -L "$LATEST_SARIF" ]] && pi_args+=("@$LATEST_SARIF")
+[[ -f "$REPORT_FILE" && ! -L "$REPORT_FILE" ]] && pi_args+=("@$REPORT_FILE")
 pi_args+=("$(cat "$PROMPT_FILE")")
 
 echo "=========================================="
@@ -335,7 +344,11 @@ if command -v git >/dev/null 2>&1 && git -C "$PROJECT_DIR" rev-parse --is-inside
     GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" read-tree --empty
   fi
   GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" add -A -- .
-  GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" diff --cached --no-ext-diff --binary "$BASELINE_TREE" -- > "$DIFF_FILE" || true
+  if ! GIT_INDEX_FILE="$AFTER_INDEX" git -C "$PROJECT_DIR" diff \
+    --cached --no-ext-diff --binary "$BASELINE_TREE" -- > "$DIFF_FILE"; then
+    echo "WARNING: failed to generate the Pi change diff." >&2
+    printf '%s\n' '# Unable to generate the Pi change diff; inspect git-status-after.txt.' > "$DIFF_FILE"
+  fi
   rm -f "$BASELINE_INDEX" "$AFTER_INDEX"
 else
   : > "$STATUS_AFTER"

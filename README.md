@@ -118,7 +118,7 @@ PI_FIX_DRY_RUN=true ./run_pi.sh --auto /path/to/project \
 
 非 dry-run 且 `PI_FIX_ALLOW_BREAKING=true` 时，Pi 可以修改项目中的必要文件。`PI_FIX_DRY_RUN=true` 或 `PI_FIX_ALLOW_BREAKING=false` 都会启用 Pi 的只读工具白名单，禁止文件修改。
 
-Pi 修复结果默认写入独立目录 `~/pi_runs/<project>-<timestamp>-<pid>/`，不会写回 Strix 扫描结果目录。可通过 `PI_OUTPUT_DIR` 修改输出根目录，但该目录必须位于项目目录之外。
+Pi 修复结果默认写入独立目录 `~/pi_runs/<project>-<timestamp>-<pid>/`，不会写回 Strix 扫描结果目录。可通过 `PI_OUTPUT_DIR` 修改输出根目录，但该目录必须同时位于项目目录和选定的 Strix 扫描结果目录之外。
 
 ## 常用环境变量
 

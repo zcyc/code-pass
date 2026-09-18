@@ -140,6 +140,13 @@ _requested_strix_bin="${STRIX_BIN:-${_default_strix_bin:-${HOME}/.strix/bin/stri
 if [[ "$_requested_strix_bin" != */* ]]; then
   _requested_strix_bin="$(command -v "$_requested_strix_bin" 2>/dev/null || true)"
 fi
+if [[ -n "$_requested_strix_bin" && "$_requested_strix_bin" != /* ]]; then
+  _requested_strix_bin="$(cd "$(dirname "$_requested_strix_bin")" 2>/dev/null &&
+    printf '%s/%s\n' "$(pwd -P)" "$(basename "$_requested_strix_bin")")" || {
+    echo "ERROR: unable to resolve STRIX_BIN: $_requested_strix_bin" >&2
+    exit 1
+  }
+fi
 readonly STRIX_BIN="$_requested_strix_bin"
 # Standalone implementation: all pipeline helper logic is embedded in this
 # launcher. Do not probe or depend on the old CI helper scripts.
@@ -164,7 +171,7 @@ FILE_SUFFIXES = {
 }
 
 def rm_path(p: Path):
-    if p.is_symlink() or p.is_file():
+    if p.is_symlink() or not p.is_dir():
         p.unlink(missing_ok=True)
     elif p.is_dir():
         shutil.rmtree(p)
@@ -172,7 +179,14 @@ def rm_path(p: Path):
 def prune(root: str):
     root = Path(root).resolve()
     removed_dirs = removed_files = 0
-    for cur, dirs, files in os.walk(root, topdown=True):
+    errors = 0
+
+    def onerror(exc):
+        nonlocal errors
+        errors += 1
+        print(f'prune: cannot access {getattr(exc, "filename", root)}: {exc}', file=sys.stderr)
+
+    for cur, dirs, files in os.walk(root, topdown=True, onerror=onerror):
         curp = Path(cur)
         kept = []
         for name in dirs:
@@ -187,6 +201,9 @@ def prune(root: str):
             if p.is_symlink():
                 rm_path(p); removed_files += 1
                 continue
+            if not p.is_file():
+                rm_path(p); removed_files += 1
+                continue
             suffix = p.suffix.lower()
             if name.startswith('.') or suffix in FILE_SUFFIXES:
                 rm_path(p); removed_files += 1
@@ -199,8 +216,10 @@ def prune(root: str):
                     b'\xfe\xed\xfa\xcf', b'\xfe\xed\xfa\xce',
                 }:
                     rm_path(p); removed_files += 1
-            except (OSError, PermissionError):
-                pass
+            except OSError as exc:
+                onerror(exc)
+    if errors:
+        raise OSError(f'prune encountered {errors} inaccessible path(s)')
     print(f"dirs={removed_dirs} files={removed_files}")
 
 def sarif_count(path: str):
@@ -279,24 +298,7 @@ if __name__ == '__main__':
         raise SystemExit(1)
 PYUTIL
 
-readonly LIFECYCLE_GUARD="${WORK_DIR}/strix_lifecycle_guard_builtin.py"
-cat > "$LIFECYCLE_GUARD" <<'PYGUARD'
-#!/usr/bin/env python3
-# Local standalone lifecycle wrapper. It preserves the command boundary used
-# by the launcher while keeping this script independent of CI-installed files.
-import os, sys
-try:
-    i = sys.argv.index('--')
-except ValueError:
-    raise SystemExit('missing -- before command')
-cmd = sys.argv[i + 1:]
-if not cmd:
-    raise SystemExit('missing command')
-os.execvp(cmd[0], cmd)
-PYGUARD
-
 export STRIX_FORCE_REQUIRED_TOOL_CHOICE="true"
-readonly STRIX_LIFECYCLE_RECOVERY_LIMIT="${STRIX_LIFECYCLE_RECOVERY_LIMIT:-5}"
 readonly STRIX_MIN_VERSION="${STRIX_MIN_VERSION:-1.4.1}"
 readonly STRIX_TIMEOUT="${STRIX_TIMEOUT:-9h30m}"
 readonly STRIX_BUDGET="${STRIX_MAX_BUDGET:-${STRIX_MAX_BUDGET_USD:-50}}"
@@ -327,11 +329,20 @@ readonly SANDBOX_NETWORK="strix-local-${RUN_ID}"
 readonly STRIX_MANAGED_LABEL="strix-managed=true"
 readonly STRIX_RUN_LABEL="strix-run-id=${RUN_ID}"
 readonly STRIX_FAIL_ON_CONTEXT_ERROR="${STRIX_FAIL_ON_CONTEXT_ERROR:-true}"
-readonly STRIX_NETWORK_RETRIES="${STRIX_NETWORK_RETRIES:-${STRIX_CONTENT_FILTER_RETRIES:-1}}"
+readonly STRIX_NETWORK_RETRIES="${STRIX_NETWORK_RETRIES:-1}"
 
 die() {
   echo "ERROR: $*" >&2
   exit 1
+}
+
+require_bool() {
+  local name="$1"
+  local value="$2"
+  case "$value" in
+    true|false) ;;
+    *) die "$name must be true or false: $value" ;;
+  esac
 }
 
 if [[ ! "$STRIX_MAX_TURNS" =~ ^[1-9][0-9]*$ ]]; then
@@ -343,6 +354,14 @@ fi
 if [[ ! "$STRIX_NETWORK_RETRIES" =~ ^[0-2]$ ]]; then
   die "Invalid STRIX_NETWORK_RETRIES (expected 0-2)"
 fi
+require_bool STRIX_FAIL_ON_CONTEXT_ERROR "$STRIX_FAIL_ON_CONTEXT_ERROR"
+require_bool STRIX_KEEP_WORKSPACE "${STRIX_KEEP_WORKSPACE:-false}"
+require_bool STRIX_COORDINATION_OPTIMIZED "${STRIX_COORDINATION_OPTIMIZED:-false}"
+require_bool STRIX_TOKEN_OPTIMIZED "${STRIX_TOKEN_OPTIMIZED:-false}"
+case "${STRIX_FRONTEND_STATIC:-auto}" in
+  auto|true|false) ;;
+  *) die "STRIX_FRONTEND_STATIC must be auto, true, or false" ;;
+esac
 
 # Raise only this process tree's soft open-file limit; Strix, systemd-run and
 # descendants inherit it. No host-wide limit change is required.
@@ -361,8 +380,6 @@ case "$STRIX_SCAN_MODE" in
 esac
 
 [[ -f "$PIPELINE_UTILS" ]] || die "Failed to initialize built-in pipeline utilities"
-[[ -f "$LIFECYCLE_GUARD" ]] || die "Failed to initialize built-in lifecycle guard"
-[[ "$STRIX_LIFECYCLE_RECOVERY_LIMIT" =~ ^([1-9]|1[0-9]|20)$ ]] || die "Invalid lifecycle recovery limit (1-20 required)"
 [[ -x "$STRIX_BIN" ]] || die "Strix executable not found: $STRIX_BIN"
 strix_version_text="$("$STRIX_BIN" -v 2>&1 || true)"
 strix_version="${strix_version_text##* }"
@@ -437,6 +454,11 @@ if command -v timeout >/dev/null 2>&1; then
   TIMEOUT_BIN="$(command -v timeout)"
 elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_BIN="$(command -v gtimeout)"
+fi
+if [[ -n "$TIMEOUT_BIN" && "$TIMEOUT_BIN" != /* ]]; then
+  TIMEOUT_BIN="$(cd "$(dirname "$TIMEOUT_BIN")" 2>/dev/null &&
+    printf '%s/%s\n' "$(pwd -P)" "$(basename "$TIMEOUT_BIN")")" ||
+    die "unable to resolve timeout helper: $TIMEOUT_BIN"
 fi
 readonly TIMEOUT_BIN
 
@@ -537,7 +559,7 @@ if ! mkdir "$ARTIFACT_DIR"; then
 fi
 
 echo "Copying local project into isolated scan workspace."
-cp -R -p "$SOURCE_DIR"/. "$TARGET_DIR"/
+cp -R -P -p "$SOURCE_DIR"/. "$TARGET_DIR"/
 
 SOURCE_REVISION="local-unversioned"
 if command -v git >/dev/null && git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -660,8 +682,9 @@ cleanup_sandbox() {
   fi
   network_active=0
 
-  network_labels="$(docker network inspect "$SANDBOX_NETWORK" \
+  network_labels="$(docker network inspect \
     --format '{{ index .Labels "strix-managed" }}|{{ index .Labels "strix-run-id" }}' \
+    "$SANDBOX_NETWORK" \
     2>/dev/null || true)"
   if [[ "$network_labels" != "true|$RUN_ID" ]]; then
     echo "Refusing to clean an unrecognized Strix network: $SANDBOX_NETWORK" >&2
@@ -676,7 +699,13 @@ cleanup_sandbox() {
     docker rm -f -- "${container_ids[@]}" >/dev/null 2>&1 || true
   fi
 
-  docker network rm "$SANDBOX_NETWORK" >/dev/null 2>&1 || true
+  for _ in {1..5}; do
+    if docker network rm "$SANDBOX_NETWORK" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.2
+  done
+  echo "WARNING: unable to remove Strix Docker network: $SANDBOX_NETWORK" >&2
 }
 
 cleanup_workspace() {
@@ -729,7 +758,7 @@ else
 fi
 echo "Execution limit: $STRIX_TIMEOUT"
 echo "Max turns per agent: $STRIX_MAX_TURNS"
-echo "Required tool choice: $STRIX_FORCE_REQUIRED_TOOL_CHOICE; lifecycle recovery limit: $STRIX_LIFECYCLE_RECOVERY_LIMIT"
+echo "Required tool choice: $STRIX_FORCE_REQUIRED_TOOL_CHOICE"
 if [[ "$USE_SYSTEMD_SCOPE" -eq 1 ]]; then
   echo "Host limit: CPU ${STRIX_HOST_CPU_QUOTA}, memory ${STRIX_HOST_MEMORY_MAX}, open files $(ulimit -Sn)"
 else
@@ -780,13 +809,6 @@ while (( attempt < max_attempts )); do
     --instruction "$COMBINED_INSTRUCTION"
   )
 
-  runner_args=(
-    python3 "$LIFECYCLE_GUARD"
-    --run-root "$STRIX_RUN_ROOT"
-    --recovery-limit "$STRIX_LIFECYCLE_RECOVERY_LIMIT" --
-    "${strix_args[@]}"
-  )
-
   if [[ "$USE_SYSTEMD_SCOPE" -eq 1 ]]; then
     scope_active=1
     execution_args=(
@@ -795,11 +817,11 @@ while (( attempt < max_attempts )); do
       -p CPUWeight=20
       -p "MemoryMax=${STRIX_HOST_MEMORY_MAX}"
       --
-      "${runner_args[@]}"
+      "${strix_args[@]}"
     )
   else
     scope_active=0
-    execution_args=("${runner_args[@]}")
+    execution_args=("${strix_args[@]}")
   fi
 
   if [[ "$RUN_UI_MODE" == "interactive" ]]; then
@@ -838,21 +860,25 @@ while (( attempt < max_attempts )); do
   retry_reason=""
   # Model refusals are terminal. Only headless mode has a captured console log,
   # so transport-error retries are intentionally limited to --auto.
-  if [[ "$RUN_UI_MODE" == "auto" ]] && \
-     ! grep -Fq 'This content was flagged for possible cybersecurity risk' "$ATTEMPT_LOG" &&
-     grep -Eq 'httpx\.(ReadTimeout|ConnectTimeout|RemoteProtocolError)|httpcore\.(ReadTimeout|ConnectTimeout|RemoteProtocolError)|openai\.(APITimeoutError|APIConnectionError)' "$ATTEMPT_LOG"; then
-    retry_reason="transient model API transport timeout"
+  if [[ "$RUN_UI_MODE" == "auto" ]] && ! grep -Fq 'This content was flagged for possible cybersecurity risk' "$ATTEMPT_LOG"; then
+    if grep -Eq \
+      'httpx\.(ReadTimeout|ConnectTimeout|RemoteProtocolError)|httpcore\.(ReadTimeout|ConnectTimeout|RemoteProtocolError)|openai\.(APITimeoutError|APIConnectionError)' \
+      "$ATTEMPT_LOG"; then
+      retry_reason="transient model API transport timeout"
+    fi
   fi
   if [[ "$strix_exit" -ne 0 && "$strix_exit" -ne 124 && "$strix_exit" -ne 130 && "$strix_exit" -ne 143 &&
         "$log_write_error" -eq 0 && "$attempt" -lt "$max_attempts" && -n "$retry_reason" ]]; then
     if (( scan_deadline - SECONDS <= 0 )); then
       break
     fi
-    # Keep failed outputs outside the active run root, so the lifecycle guard
-    # and final result selection cannot mistake an old run for the new attempt.
+    # Keep failed outputs outside the active run root so final result selection
+    # cannot mistake an old attempt for the new one.
     archive="$ARTIFACT_DIR/attempt-${attempt}-state"
     mkdir -p "$archive" || break
-    mv "$STRIX_RUN_ROOT" "$archive/strix_runs" || break
+    if [[ -d "$STRIX_RUN_ROOT" ]]; then
+      mv "$STRIX_RUN_ROOT" "$archive/strix_runs" || break
+    fi
     if [[ -d "$TARGET_DIR/strix_runs" ]]; then
       mv "$TARGET_DIR/strix_runs" "$archive/target-strix_runs" || break
     fi
@@ -970,14 +996,14 @@ if [[ "$sarif_valid" -eq 1 && -n "$sarif_source" ]]; then
   run_dir="$(dirname "$sarif_source")"
   cp "$sarif_source" "$ARTIFACT_DIR/findings.sarif"
 
-  if [[ -f "$run_dir/vulnerabilities.csv" ]]; then
+  if [[ -f "$run_dir/vulnerabilities.csv" && ! -L "$run_dir/vulnerabilities.csv" ]]; then
     cp "$run_dir/vulnerabilities.csv" "$ARTIFACT_DIR/vulnerabilities.csv"
   else
     echo "NOTICE: Strix did not produce vulnerabilities.csv." >&2
   fi
 
-  if [[ -d "$run_dir/vulnerabilities" ]]; then
-    cp -R -p "$run_dir/vulnerabilities" "$ARTIFACT_DIR/vulnerabilities"
+  if [[ -d "$run_dir/vulnerabilities" && ! -L "$run_dir/vulnerabilities" ]]; then
+    cp -R -P -p "$run_dir/vulnerabilities" "$ARTIFACT_DIR/vulnerabilities"
   else
     echo "NOTICE: Strix did not produce a vulnerabilities directory." >&2
   fi
