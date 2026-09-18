@@ -149,22 +149,33 @@ readonly PI_READ_ONLY
 PROJECT_NAME="$(basename "$PROJECT_DIR")"
 PROJECT_NAME="$(printf '%s' "$PROJECT_NAME" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
 [[ -n "$PROJECT_NAME" ]] || PROJECT_NAME="project"
+# Keep artifact names well below common filesystem component limits.
+PROJECT_NAME="${PROJECT_NAME:0:64}"
 readonly PROJECT_NAME
 REPORT_FILE="$SCAN_DIR/penetration_test_report.md"
 STATUS_FILE="$SCAN_DIR/scan-status.txt"
 SCAN_LOG="$SCAN_DIR/strix-console.log"
 
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+canonicalize_path() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+print(Path(os.path.abspath(sys.argv[1])).resolve(strict=False))
+PY
+}
+
 PI_OUTPUT_ROOT="${PI_OUTPUT_DIR:-${HOME:?HOME is required}/pi_runs}"
-case "$PI_OUTPUT_ROOT" in
-  /*) ;;
-  *) PI_OUTPUT_ROOT="$(pwd -P)/$PI_OUTPUT_ROOT" ;;
-esac
+PI_OUTPUT_ROOT="$(canonicalize_path "$PI_OUTPUT_ROOT")" ||
+  die "cannot resolve Pi output root: ${PI_OUTPUT_DIR:-$PI_OUTPUT_ROOT}"
 case "$PI_OUTPUT_ROOT/" in
   "$PROJECT_DIR/"*) die "PI_OUTPUT_DIR must be outside the project directory: $PI_OUTPUT_ROOT" ;;
   "$SCAN_DIR/"*) die "PI_OUTPUT_DIR must be outside the selected Strix scan result: $PI_OUTPUT_ROOT" ;;
 esac
 mkdir -p "$PI_OUTPUT_ROOT" || die "cannot create Pi output root: $PI_OUTPUT_ROOT"
-PI_OUTPUT_ROOT="$(cd "$PI_OUTPUT_ROOT" 2>/dev/null && pwd -P)" ||
+PI_OUTPUT_ROOT="$(canonicalize_path "$PI_OUTPUT_ROOT")" ||
   die "cannot resolve Pi output root: $PI_OUTPUT_ROOT"
 case "$PI_OUTPUT_ROOT/" in
   "$PROJECT_DIR/"*) die "PI_OUTPUT_DIR must be outside the project directory: $PI_OUTPUT_ROOT" ;;

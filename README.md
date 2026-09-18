@@ -79,7 +79,7 @@ STRIX_OUTPUT_DIR=/path/to/scan-results \
   ./run_strix.sh --auto /path/to/project standard
 ```
 
-输出根目录必须位于项目目录之外，避免扫描结果被再次复制进扫描工作区或修改项目目录。
+输出根目录必须位于项目目录之外，脚本会按真实路径解析符号链接，避免扫描结果被再次复制进扫描工作区或修改项目目录。
 
 扫描完成后，命令行会打印实际的 `Results` 路径。后续运行 `run_pi.sh` 时，应使用这次扫描打印出的具体目录，不要依赖目录排序猜测最新结果。
 
@@ -128,7 +128,7 @@ Pi 修复结果默认写入独立目录 `~/pi_runs/<project>-<timestamp>-<pid>/`
 | --- | --- | --- |
 | `STRIX_BIN` | `strix` 或 `~/.strix/bin/strix` | Strix 可执行文件路径 |
 | `STRIX_OUTPUT_DIR` | `~/strix_runs` | 报告输出根目录 |
-| `STRIX_RUN_ID` | `<project>-<timestamp>-<pid>` | 自定义本次扫描 ID |
+| `STRIX_RUN_ID` | `<project>-<timestamp>-<pid>` | 自定义本次扫描 ID；仅允许 ASCII 字符，最多 48 个字符 |
 | `STRIX_RUN_UI_MODE` | `interactive` | `interactive` 或 `auto` |
 | `STRIX_SCAN_MODE` | `quick` | 未通过位置参数指定时的扫描模式 |
 | `STRIX_MAX_BUDGET` | `50` | Strix 最大预算；也支持 `STRIX_MAX_BUDGET_USD` |

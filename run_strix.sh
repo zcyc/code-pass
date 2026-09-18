@@ -91,28 +91,43 @@ readonly SOURCE_DIR
 PROJECT_NAME="$(basename "$SOURCE_DIR")"
 PROJECT_NAME="$(printf '%s' "$PROJECT_NAME" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
 [[ -n "$PROJECT_NAME" ]] || PROJECT_NAME="project"
+# Docker network names include this value plus a fixed prefix. Keep generated
+# IDs short enough for Docker, mktemp and systemd resource names.
+PROJECT_NAME="${PROJECT_NAME:0:24}"
 readonly PROJECT_NAME
 
 STRIX_SCAN_MODE="${2:-${STRIX_SCAN_MODE:-quick}}"
 readonly STRIX_SCAN_MODE
 
+command -v python3 >/dev/null 2>&1 || {
+  echo "ERROR: python3 is required" >&2
+  exit 1
+}
+canonicalize_path() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+print(Path(os.path.abspath(sys.argv[1])).resolve(strict=False))
+PY
+}
+
 OUTPUT_ROOT="${STRIX_OUTPUT_DIR:-${HOME:?HOME is required}/strix_runs}"
-case "$OUTPUT_ROOT" in
-  /*) ;;
-  *) OUTPUT_ROOT="$(pwd -P)/$OUTPUT_ROOT" ;;
-esac
-if [[ -d "$OUTPUT_ROOT" ]]; then
-  OUTPUT_ROOT="$(cd "$OUTPUT_ROOT" 2>/dev/null && pwd -P)" || {
-    echo "ERROR: unable to resolve STRIX_OUTPUT_DIR: $OUTPUT_ROOT" >&2
-    exit 1
-  }
-fi
+OUTPUT_ROOT="$(canonicalize_path "$OUTPUT_ROOT")" || {
+  echo "ERROR: unable to resolve STRIX_OUTPUT_DIR: ${STRIX_OUTPUT_DIR:-$OUTPUT_ROOT}" >&2
+  exit 1
+}
 case "$OUTPUT_ROOT/" in
   "$SOURCE_DIR/"*) echo "ERROR: STRIX_OUTPUT_DIR must be outside the project directory: $OUTPUT_ROOT" >&2; exit 1 ;;
 esac
 readonly OUTPUT_ROOT
 RUN_ID="${STRIX_RUN_ID:-${PROJECT_NAME}-$(date '+%Y%m%d-%H%M%S')-$$}"
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "ERROR: invalid STRIX_RUN_ID: $RUN_ID" >&2; exit 1; }
+(( ${#RUN_ID} <= 48 )) || {
+  echo "ERROR: STRIX_RUN_ID is too long (maximum 48 ASCII characters): $RUN_ID" >&2
+  exit 1
+}
 readonly RUN_ID
 readonly ARTIFACT_DIR="${OUTPUT_ROOT}/${RUN_ID}"
 TMP_ROOT="${TMPDIR:-/tmp}"
@@ -412,8 +427,6 @@ require_strix_option "--max-budget"
 require_strix_option "--max-turns"
 require_strix_option "--instruction"
 
-command -v python3 >/dev/null || die "python3 is required"
-
 if [[ "$RUN_UI_MODE" == "interactive" ]]; then
   STRIX_MAX_ATTEMPTS=1
 else
@@ -656,14 +669,19 @@ cleanup_scope() {
   if [[ "$USE_SYSTEMD_SCOPE" -ne 1 || "$scope_active" -ne 1 ]]; then
     return
   fi
-  scope_active=0
   if ! systemctl --user is-active --quiet "$scope_unit"; then
+    if systemctl --user show-environment >/dev/null 2>&1; then
+      scope_active=0
+    else
+      echo "WARNING: unable to inspect Strix systemd scope; will retry cleanup." >&2
+    fi
     return
   fi
   echo "Stopping Strix systemd scope: $scope_unit" >&2
   systemctl --user kill --kill-whom=all --signal=SIGTERM "$scope_unit" >/dev/null 2>&1 || true
   for _ in {1..10}; do
     if ! systemctl --user is-active --quiet "$scope_unit"; then
+      scope_active=0
       return
     fi
     sleep 0.2
@@ -671,22 +689,36 @@ cleanup_scope() {
   echo "Force-killing Strix systemd scope: $scope_unit" >&2
   systemctl --user kill --kill-whom=all --signal=SIGKILL "$scope_unit" >/dev/null 2>&1 || true
   systemctl --user stop --no-block "$scope_unit" >/dev/null 2>&1 || true
+  if ! systemctl --user is-active --quiet "$scope_unit"; then
+    scope_active=0
+  fi
 }
 
 cleanup_sandbox() {
   local -a container_ids=()
-  local network_labels
+  local network_labels network_names
 
   if [[ "$network_active" -ne 1 ]]; then
     return
   fi
-  network_active=0
 
-  network_labels="$(docker network inspect \
-    --format '{{ index .Labels "strix-managed" }}|{{ index .Labels "strix-run-id" }}' \
-    "$SANDBOX_NETWORK" \
-    2>/dev/null || true)"
+  if ! network_labels="$(docker network inspect \
+      --format '{{ index .Labels "strix-managed" }}|{{ index .Labels "strix-run-id" }}' \
+      "$SANDBOX_NETWORK" 2>/dev/null)"; then
+    network_names="$(docker network ls --filter "name=${SANDBOX_NETWORK}" \
+      --format '{{.Name}}' 2>/dev/null)" || {
+      echo "WARNING: unable to inspect Strix Docker network; will retry cleanup." >&2
+      return
+    }
+    if [[ -z "$network_names" ]]; then
+      network_active=0
+    else
+      echo "WARNING: Strix Docker network exists but could not be inspected; will retry cleanup." >&2
+    fi
+    return
+  fi
   if [[ "$network_labels" != "true|$RUN_ID" ]]; then
+    network_active=0
     echo "Refusing to clean an unrecognized Strix network: $SANDBOX_NETWORK" >&2
     return
   fi
@@ -701,6 +733,7 @@ cleanup_sandbox() {
 
   for _ in {1..5}; do
     if docker network rm "$SANDBOX_NETWORK" >/dev/null 2>&1; then
+      network_active=0
       return
     fi
     sleep 0.2
