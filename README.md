@@ -136,7 +136,7 @@ Pi 修复结果默认写入独立目录 `~/pi_runs/<project>-<timestamp>-<pid>/`
 | `STRIX_MAX_TURNS` | 按扫描模式设置 | 每个 agent 的最大轮数 |
 | `STRIX_NETWORK_RETRIES` | `1` | 无交互模式下的临时网络错误重试次数，范围 `0-2` |
 | `STRIX_KEEP_WORKSPACE` | `false` | 设为 `true` 时保留临时扫描工作区 |
-| `STRIX_FRONTEND_STATIC` | `auto` | 设为 `true` 时强制纯静态审计 |
+| `STRIX_FRONTEND_STATIC` | `false` | 设为 `true` 时强制纯静态审计 |
 
 例如：
 
@@ -155,6 +155,7 @@ STRIX_MAX_BUDGET=30 \
 | `PI_OUTPUT_DIR` | `~/pi_runs` | Pi 修复结果输出根目录 |
 | `PI_FIX_DRY_RUN` | `false` | 设为 `true` 时只分析，不修改项目 |
 | `PI_FIX_ALLOW_BREAKING` | `true` | `true` 允许写入；`false` 启用只读建议模式，禁止所有文件修改 |
+| `PI_TIMEOUT` | `9h30m` | Pi 总超时时间，如 `30m`、`3600s` |
 
 例如：
 

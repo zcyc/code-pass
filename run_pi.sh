@@ -38,6 +38,7 @@ Environment variables:
   PI_FIX_ALLOW_BREAKING  true => allow file edits, including unavoidable
                          breaking fixes, for verified High/Critical issues.
                          Default true. Set false for a read-only run.
+  PI_TIMEOUT             total Pi timeout. Default: 9h30m
 
 Examples:
   ./run_pi.sh ~/src/my-project ~/strix_runs/my-project_0f73
@@ -136,6 +137,7 @@ readonly PI_BIN
 
 PI_FIX_DRY_RUN="${PI_FIX_DRY_RUN:-false}"
 PI_FIX_ALLOW_BREAKING="${PI_FIX_ALLOW_BREAKING:-true}"
+readonly PI_TIMEOUT="${PI_TIMEOUT:-9h30m}"
 
 case "$PI_FIX_DRY_RUN" in true|false) ;; *) die "PI_FIX_DRY_RUN must be true or false" ;; esac
 case "$PI_FIX_ALLOW_BREAKING" in true|false) ;; *) die "PI_FIX_ALLOW_BREAKING must be true or false" ;; esac
@@ -166,6 +168,28 @@ from pathlib import Path
 print(Path(os.path.abspath(sys.argv[1])).resolve(strict=False))
 PY
 }
+
+PI_TIMEOUT_SECONDS="$(python3 - "$PI_TIMEOUT" <<'PY'
+import re
+import sys
+
+raw = sys.argv[1].strip()
+if re.fullmatch(r"\d+(\.\d+)?", raw):
+    print(int(float(raw)))
+    raise SystemExit
+units = {"h": 3600, "m": 60, "s": 1}
+total = 0.0
+matched = False
+for number, unit in re.findall(r"(\d+(?:\.\d+)?)([hms])", raw):
+    total += float(number) * units[unit]
+    matched = True
+if not matched or re.sub(r"\d+(?:\.\d+)?[hms]", "", raw):
+    raise SystemExit(1)
+print(int(total))
+PY
+)" || die "invalid PI_TIMEOUT: $PI_TIMEOUT (use forms like 9h30m, 9h, 570m, 34200s)"
+[[ "$PI_TIMEOUT_SECONDS" -gt 0 ]] || die "PI_TIMEOUT must be positive"
+readonly PI_TIMEOUT_SECONDS
 
 PI_OUTPUT_ROOT="${PI_OUTPUT_DIR:-${HOME:?HOME is required}/pi_runs}"
 PI_OUTPUT_ROOT="$(canonicalize_path "$PI_OUTPUT_ROOT")" ||
@@ -233,6 +257,7 @@ allow_breaking=$PI_FIX_ALLOW_BREAKING
 read_only=$PI_READ_ONLY
 mode=$PI_MODE
 started_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
+timeout=$PI_TIMEOUT
 EOF_META
 
 # shellcheck disable=SC1111
@@ -309,6 +334,46 @@ fi
 [[ -f "$REPORT_FILE" && ! -L "$REPORT_FILE" ]] && pi_args+=("@$REPORT_FILE")
 pi_args+=("$(cat "$PROMPT_FILE")")
 
+run_pi_with_timeout() {
+  local seconds="$1"
+  shift
+  python3 -c '
+import os, signal, subprocess, sys
+seconds = float(sys.argv[1])
+interactive = sys.argv[2] == "interactive"
+cmd = sys.argv[3:]
+p = subprocess.Popen(cmd, start_new_session=not interactive)
+
+def signal_child(signum):
+    try:
+        if interactive:
+            os.kill(p.pid, signum)
+        else:
+            os.killpg(p.pid, signum)
+    except ProcessLookupError:
+        pass
+
+def forward(signum, _frame):
+    signal_child(signum)
+
+signal.signal(signal.SIGINT, forward)
+signal.signal(signal.SIGTERM, forward)
+try:
+    rc = p.wait(timeout=seconds)
+except subprocess.TimeoutExpired:
+    signal_child(signal.SIGINT)
+    try:
+        p.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        signal_child(signal.SIGKILL)
+        p.wait()
+    sys.exit(124)
+if rc < 0:
+    sys.exit(128 + (-rc))
+sys.exit(rc)
+' "$seconds" "$PI_MODE" "$@"
+}
+
 echo "=========================================="
 echo "Pi security remediation"
 echo "Project:    $PROJECT_DIR"
@@ -318,15 +383,21 @@ echo "Output:     $FIX_DIR"
 echo "Mode:       $PI_MODE"
 echo "Dry run:    $PI_FIX_DRY_RUN"
 echo "Breaking:   $PI_FIX_ALLOW_BREAKING"
+echo "Timeout:    $PI_TIMEOUT"
 echo "=========================================="
 
 set +e
 if [[ "$PI_MODE" == "auto" ]]; then
   (
     cd "$PROJECT_DIR"
-    "$PI_BIN" "${pi_args[@]}"
+    run_pi_with_timeout "$PI_TIMEOUT_SECONDS" "$PI_BIN" "${pi_args[@]}"
   ) 2>&1 | tee "$SUMMARY_FILE"
-  pi_status=${PIPESTATUS[0]}
+  pipeline_status=("${PIPESTATUS[@]}")
+  pi_status="${pipeline_status[0]}"
+  if [[ "${pipeline_status[1]}" -ne 0 ]]; then
+    echo "Failed to persist Pi summary." >&2
+    [[ "$pi_status" -ne 0 ]] || pi_status=1
+  fi
 else
   # Do not pipe an interactive Pi process through tee: keeping stdout/stderr
   # attached to the terminal is required for the full-screen Pi UI.
@@ -340,7 +411,7 @@ EOF_SUMMARY
   (
     cd "$PROJECT_DIR"
     echo "Entering Pi interactive session..."
-    "$PI_BIN" "${pi_args[@]}"
+    run_pi_with_timeout "$PI_TIMEOUT_SECONDS" "$PI_BIN" "${pi_args[@]}"
   )
   pi_status=$?
 fi

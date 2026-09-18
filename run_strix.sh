@@ -149,6 +149,7 @@ readonly WORK_DIR
 trap 'rm -rf "$WORK_DIR"' EXIT
 readonly TARGET_DIR="${WORK_DIR}/target"
 readonly STRIX_RUN_ROOT="${WORK_DIR}/strix_runs"
+readonly STRIX_RUN_TOKEN="${WORK_DIR##*.}"
 
 _default_strix_bin="$(command -v strix 2>/dev/null || true)"
 _requested_strix_bin="${STRIX_BIN:-${_default_strix_bin:-${HOME}/.strix/bin/strix}}"
@@ -343,6 +344,7 @@ readonly SCAN_LOG="${ARTIFACT_DIR}/strix-console.log"
 readonly SANDBOX_NETWORK="strix-local-${RUN_ID}"
 readonly STRIX_MANAGED_LABEL="strix-managed=true"
 readonly STRIX_RUN_LABEL="strix-run-id=${RUN_ID}"
+readonly STRIX_TOKEN_LABEL="strix-run-token=${STRIX_RUN_TOKEN}"
 readonly STRIX_FAIL_ON_CONTEXT_ERROR="${STRIX_FAIL_ON_CONTEXT_ERROR:-true}"
 readonly STRIX_NETWORK_RETRIES="${STRIX_NETWORK_RETRIES:-1}"
 
@@ -373,9 +375,9 @@ require_bool STRIX_FAIL_ON_CONTEXT_ERROR "$STRIX_FAIL_ON_CONTEXT_ERROR"
 require_bool STRIX_KEEP_WORKSPACE "${STRIX_KEEP_WORKSPACE:-false}"
 require_bool STRIX_COORDINATION_OPTIMIZED "${STRIX_COORDINATION_OPTIMIZED:-false}"
 require_bool STRIX_TOKEN_OPTIMIZED "${STRIX_TOKEN_OPTIMIZED:-false}"
-case "${STRIX_FRONTEND_STATIC:-auto}" in
-  auto|true|false) ;;
-  *) die "STRIX_FRONTEND_STATIC must be auto, true, or false" ;;
+case "${STRIX_FRONTEND_STATIC:-false}" in
+  true|false) ;;
+  *) die "STRIX_FRONTEND_STATIC must be true or false" ;;
 esac
 
 # Raise only this process tree's soft open-file limit; Strix, systemd-run and
@@ -494,8 +496,6 @@ else
 fi
 if [[ -n "$TIMEOUT_BIN" ]]; then
   echo "Timeout helper: $TIMEOUT_BIN"
-elif [[ "$RUN_UI_MODE" == "interactive" ]]; then
-  echo "NOTICE: GNU timeout/gtimeout not found; interactive TUI will run without an outer timeout to preserve the real terminal." >&2
 else
   echo "NOTICE: GNU timeout/gtimeout not found; using portable Python timeout helper." >&2
 fi
@@ -514,48 +514,41 @@ run_with_timeout() {
     return $?
   fi
 
-  if [[ "$RUN_UI_MODE" == "interactive" ]]; then
-    # The Python fallback uses a new session so it can kill the whole process
-    # tree on timeout. That intentionally breaks controlling-terminal semantics,
-    # so never use it for the Strix TUI.
-    "$@"
-    return $?
-  fi
-
   python3 -c '
 import os, signal, subprocess, sys
 seconds = float(sys.argv[1])
-cmd = sys.argv[2:]
-p = subprocess.Popen(cmd, start_new_session=True)
+interactive = sys.argv[2] == "interactive"
+cmd = sys.argv[3:]
+p = subprocess.Popen(cmd, start_new_session=not interactive)
 
-def forward(signum, _frame):
+def signal_child(signum):
     try:
-        os.killpg(p.pid, signum)
+        if interactive:
+            os.kill(p.pid, signum)
+        else:
+            os.killpg(p.pid, signum)
     except ProcessLookupError:
         pass
+
+def forward(signum, _frame):
+    signal_child(signum)
 
 signal.signal(signal.SIGINT, forward)
 signal.signal(signal.SIGTERM, forward)
 try:
     rc = p.wait(timeout=seconds)
 except subprocess.TimeoutExpired:
-    try:
-        os.killpg(p.pid, signal.SIGINT)
-    except ProcessLookupError:
-        pass
+    signal_child(signal.SIGINT)
     try:
         p.wait(timeout=60)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        signal_child(signal.SIGKILL)
         p.wait()
     sys.exit(124)
 if rc < 0:
     sys.exit(128 + (-rc))
 sys.exit(rc)
-' "$seconds" "$@"
+' "$seconds" "$RUN_UI_MODE" "$@"
 }
 
 
@@ -609,21 +602,10 @@ fi
 prune_summary="$(python3 "$PIPELINE_UTILS" prune "$TARGET_DIR")"
 echo "Pruned source inputs: $prune_summary"
 
-# 前端仓库（poker/client/*）没有可交互的运行服务，也没有真实 HTTP 流量。
-# 模型在这种场景下仍可能去调用 Strix 内置的 HTTP 代理/请求工具（如
-# view_request / repeat_request），因缺少合法请求 ID 触发 Caido 的
-# "Invalid ID format, should be an i32" 错误，最终可能导致 Prepared model
-# input is empty 崩溃。Strix 1.4.1 是打包好的单体二进制，CLI 无禁用工具的
-# 开关，config 只控制 env，所以无法从工具层面硬禁用这些工具；只能靠指令约束。
-# 为提高约束的服从度，把前端禁用约束作为最高优先级前置到指令最开头（在
-# COMMON 之前），并用更强的措辞明确「这些工具在本环境永远返回错误、任何情况
-# 下都不要调用」。
+# 对没有运行中服务的仓库，可以显式启用纯静态审计约束，避免模型调用
+# 依赖代理会话或 request/response ID 的动态工具。
 FRONTEND_STATIC_INSTRUCTION=""
-if [[ "${STRIX_FRONTEND_STATIC:-auto}" == "true" ||
-      ( "${STRIX_FRONTEND_STATIC:-auto}" == "auto" &&
-        ( "$SOURCE_DIR" == */poker/client/* ||
-          "$(basename "$SOURCE_DIR")" == "niugameclient" ||
-          "$(basename "$SOURCE_DIR")" == "newmanageplatform-font" ) ) ]]; then
+if [[ "${STRIX_FRONTEND_STATIC:-false}" == "true" ]]; then
   FRONTEND_STATIC_INSTRUCTION='【最高优先级硬约束，凌驾于下方所有指令之上】这是一个前端/客户端代码仓库，本次任务只做纯静态源代码审计。当前环境没有任何运行中的目标服务，没有 HTTP 代理会话，也没有任何真实网络流量，代理里不存在任何请求；view_request、repeat_request、list_requests、sitemap，以及任何依赖 Caido 代理或 request/response ID 的工具在本环境永远只会返回错误，绝不会返回有效数据。因此：无论出于任何理由、无论你认为多么需要查看或重放某个请求，都绝对不要调用上述任何工具，也不要凭空构造、猜测或编造请求 ID。请把这些代理/动态测试类工具视为在本次任务中完全不存在。你只能通过阅读和搜索源代码、脚本、配置、依赖清单来发现漏洞，所有结论必须基于静态代码证据。'
 fi
 
@@ -703,7 +685,7 @@ cleanup_sandbox() {
   fi
 
   if ! network_labels="$(docker network inspect \
-      --format '{{ index .Labels "strix-managed" }}|{{ index .Labels "strix-run-id" }}' \
+      --format '{{ index .Labels "strix-managed" }}|{{ index .Labels "strix-run-id" }}|{{ index .Labels "strix-run-token" }}' \
       "$SANDBOX_NETWORK" 2>/dev/null)"; then
     network_names="$(docker network ls --filter "name=${SANDBOX_NETWORK}" \
       --format '{{.Name}}' 2>/dev/null)" || {
@@ -717,7 +699,7 @@ cleanup_sandbox() {
     fi
     return
   fi
-  if [[ "$network_labels" != "true|$RUN_ID" ]]; then
+  if [[ "$network_labels" != "true|$RUN_ID|$STRIX_RUN_TOKEN" ]]; then
     network_active=0
     echo "Refusing to clean an unrecognized Strix network: $SANDBOX_NETWORK" >&2
     return
@@ -768,10 +750,13 @@ trap 'cancel_scan INT 130' INT
 trap cleanup_all EXIT
 
 network_active=1
-docker network create \
-  --label "$STRIX_MANAGED_LABEL" \
-  --label "$STRIX_RUN_LABEL" \
-  "$SANDBOX_NETWORK" >/dev/null
+if ! docker network create \
+    --label "$STRIX_MANAGED_LABEL" \
+    --label "$STRIX_RUN_LABEL" \
+    --label "$STRIX_TOKEN_LABEL" \
+    "$SANDBOX_NETWORK" >/dev/null; then
+  die "Unable to create job-specific Docker network: $SANDBOX_NETWORK"
+fi
 
 # Strix applies these values when it creates this job's Docker sandbox.
 export STRIX_DOCKER_SANDBOX_NETWORK="$SANDBOX_NETWORK"
@@ -918,7 +903,8 @@ while (( attempt < max_attempts )); do
     cleanup_sandbox
     network_active=1
     if ! docker network create --label "$STRIX_MANAGED_LABEL" \
-      --label "$STRIX_RUN_LABEL" "$SANDBOX_NETWORK" >/dev/null; then
+      --label "$STRIX_RUN_LABEL" \
+      --label "$STRIX_TOKEN_LABEL" "$SANDBOX_NETWORK" >/dev/null; then
       break
     fi
     echo "NOTICE: Retrying transport failure within reserved total time/budget; previous state preserved." | tee -a "$SCAN_LOG"
