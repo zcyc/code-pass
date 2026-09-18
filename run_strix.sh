@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 RUN_STRIX_PIPELINE_VERSION="3.3.2-local"
 
@@ -373,6 +374,17 @@ require_strix_option "--max-turns"
 require_strix_option "--instruction"
 
 command -v python3 >/dev/null || die "python3 is required"
+
+if [[ "$RUN_UI_MODE" == "interactive" ]]; then
+  STRIX_MAX_ATTEMPTS=1
+else
+  STRIX_MAX_ATTEMPTS=$((STRIX_NETWORK_RETRIES + 1))
+fi
+readonly STRIX_MAX_ATTEMPTS
+STRIX_ATTEMPT_BUDGET="$(python3 "$PIPELINE_UTILS" retry-budget "$STRIX_BUDGET" "$STRIX_MAX_ATTEMPTS")" ||
+  die "Invalid STRIX_MAX_BUDGET: $STRIX_BUDGET"
+readonly STRIX_ATTEMPT_BUDGET
+
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "Docker daemon is unavailable to the current user"
 
@@ -494,7 +506,6 @@ if docker network inspect "$SANDBOX_NETWORK" >/dev/null 2>&1; then
   die "Job-specific Docker network already exists: $SANDBOX_NETWORK"
 fi
 
-rm -rf "$WORK_DIR/target" "$STRIX_RUN_ROOT"
 mkdir -p "$TARGET_DIR" "$(dirname "$ARTIFACT_DIR")"
 
 # Reserve the output directory atomically. Reusing a run ID could merge stale
@@ -705,17 +716,10 @@ echo "Source transfer: local sanitized copy via --target."
 cd "$WORK_DIR"
 attempt=0
 scan_deadline=$((SECONDS + STRIX_TIMEOUT_SECONDS))
-if [[ "$RUN_UI_MODE" == "interactive" ]]; then
-  # A retry would tear down and recreate the user's TUI session. Keep the visual
-  # mode to a single attempt; --auto retains transport retries and full logging.
-  max_attempts=1
-else
-  max_attempts=$((STRIX_NETWORK_RETRIES + 1))
-fi
-# A local retry cannot know how much Strix has already charged. Reserve an
-# equal slice for every possible attempt so the configured total remains a cap.
-attempt_budget="$(python3 "$PIPELINE_UTILS" retry-budget "$STRIX_BUDGET" "$max_attempts")" ||
-  die "Invalid STRIX_MAX_BUDGET: $STRIX_BUDGET"
+# Interactive mode has one attempt because retrying would tear down its TUI;
+# auto mode retains bounded transport retries and full logging.
+max_attempts="$STRIX_MAX_ATTEMPTS"
+attempt_budget="$STRIX_ATTEMPT_BUDGET"
 echo "Budget: total=$STRIX_BUDGET; per-attempt maximum=$attempt_budget"
 set +e
 while (( attempt < max_attempts )); do
