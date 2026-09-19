@@ -972,7 +972,7 @@ copy_run_artifacts() {
   local source_run_dir="$1"
   cp "$source_run_dir/findings.sarif" "$ARTIFACT_DIR/findings.sarif"
   local extra
-  for extra in run.json strix.log; do
+  for extra in run.json strix.log vulnerabilities.json coverage.json; do
     if [[ -f "$source_run_dir/$extra" && ! -L "$source_run_dir/$extra" ]]; then
       cp "$source_run_dir/$extra" "$ARTIFACT_DIR/$extra"
     fi

@@ -176,6 +176,8 @@ PI_FIX_ALLOW_BREAKING=false \
 ├── findings.sarif
 ├── penetration_test_report.md
 ├── vulnerabilities.csv
+├── vulnerabilities.json
+├── coverage.json
 ├── vulnerabilities/
 ├── run.json
 ├── strix.log
