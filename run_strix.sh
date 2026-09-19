@@ -1124,3 +1124,4 @@ echo "Results: $ARTIFACT_DIR"
 if [[ "$RUN_UI_MODE" == "interactive" ]]; then
   echo "NOTE: the interactive TUI transcript is not captured in strix-console.log; Strix's own strix.log and run.json are preserved in the result directory for diagnostics."
 fi
+echo "View: strix view $ARTIFACT_DIR"
