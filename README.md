@@ -21,10 +21,28 @@
 首次使用前确认脚本可执行：
 
 ```bash
-chmod +x run_strix.sh run_pi.sh
+chmod +x run_strix.sh run_pi.sh run_code_pass.sh
 ```
 
 ## 推荐流程
+
+### 自动循环：扫描、修复、再验证
+
+run_code_pass.sh 是总编排器，最多执行有限轮次的 Strix 扫描和 Pi 修复。它会在扫描失败、Pi 无改动、同一 finding 指纹重复或达到最大轮数时停止，避免无限消耗 token。
+
+~~~text
+./run_code_pass.sh [--interactive|--auto] [--max-rounds N] \
+  [--verify-cmd "command"] <local-project-dir> [quick|standard|deep]
+~~~
+
+示例：
+
+~~~bash
+./run_code_pass.sh --auto --verify-cmd "npm test" /path/to/project standard
+CODE_PASS_MAX_ROUNDS=2 ./run_code_pass.sh --auto /path/to/project quick
+~~~
+
+默认最多 3 轮，并把 STRIX_MAX_BUDGET（默认 50）视为整个循环的总预算，平均分配到各轮。可用 CODE_PASS_MAX_TOTAL_BUDGET 显式覆盖总预算。没有提供验证命令时，零 finding 只表示安全扫描通过，测试会明确跳过。
 
 ### 1. 运行 Strix 扫描
 
