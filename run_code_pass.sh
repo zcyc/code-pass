@@ -9,29 +9,24 @@ usage() {
   cat <<'USAGE'
 Usage:
   run_code_pass.sh [--interactive|--auto] [--max-rounds N] \
-    [--verify-cmd "command"] <local-project-dir> [quick|standard|deep]
+    <local-project-dir> [quick|standard|deep]
 
 The loop runs a bounded Strix scan -> Pi remediation cycle. It stops when:
   - the scan is incomplete or operationally failed;
-  - no findings remain (then the optional verify command is run);
+  - no findings remain;
   - Pi makes no change;
   - the same finding fingerprint returns in the next scan; or
   - the round limit is reached.
 
 Examples:
-  ./run_code_pass.sh --auto --verify-cmd "npm test" ~/src/my-project standard
-  ./run_code_pass.sh --auto --verify-cmd "pytest -q" ~/src/my-project quick
   CODE_PASS_MAX_ROUNDS=2 ./run_code_pass.sh --auto ~/src/my-project
 
 Environment:
   CODE_PASS_OUTPUT_DIR          Default: ~/code_pass_runs
   CODE_PASS_MAX_ROUNDS          Default: 3
   CODE_PASS_MAX_TOTAL_BUDGET    Total Strix budget split across rounds; defaults to STRIX_MAX_BUDGET or 50
-  CODE_PASS_VERIFY_CMD          Optional trusted local verification command
   STRIX_MAX_BUDGET              Used as the total loop budget unless overridden above
   PI_TIMEOUT                    Optional timeout passed through to run_pi.sh
-
-CODE_PASS_VERIFY_CMD and --verify-cmd are operator-provided local commands.
 USAGE
 }
 
@@ -147,29 +142,6 @@ run_self_test() {
   echo "run_code_pass self-test: ok"
 }
 
-run_verification() {
-  local round="$1"
-  local log_file="$RUN_DIR/verify-round-$round.log"
-  if [[ -z "$VERIFY_CMD" ]]; then
-    echo "Verification: skipped (no command supplied)."
-    return 0
-  fi
-
-  echo "Verification: $VERIFY_CMD"
-  set +e
-  (
-    cd "$PROJECT_DIR"
-    bash -c "$VERIFY_CMD"
-  ) >"$log_file" 2>&1
-  local verify_status=$?
-  set -e
-  if (( verify_status != 0 )); then
-    echo "Verification failed with exit code $verify_status; see $log_file" >&2
-    return "$verify_status"
-  fi
-  echo "Verification passed."
-}
-
 changed_paths_from_diff() {
   local diff_file="$1"
   sed -n 's/^diff --git a\/\(.*\) b\/.*$/\1/p' "$diff_file" | sort -u
@@ -178,7 +150,6 @@ changed_paths_from_diff() {
 RUN_MODE="${CODE_PASS_RUN_UI_MODE:-auto}"
 MAX_ROUNDS="${CODE_PASS_MAX_ROUNDS:-3}"
 TOTAL_BUDGET="${CODE_PASS_MAX_TOTAL_BUDGET:-${STRIX_MAX_BUDGET:-50}}"
-VERIFY_CMD="${CODE_PASS_VERIFY_CMD:-}"
 PROJECT_ARG=""
 SCAN_MODE_ARG=""
 SELF_TEST=false
@@ -196,11 +167,6 @@ while [[ $# -gt 0 ]]; do
     --max-rounds)
       [[ $# -ge 2 ]] || die "--max-rounds requires a positive integer"
       MAX_ROUNDS="$2"
-      shift 2
-      ;;
-    --verify-cmd)
-      [[ $# -ge 2 ]] || die "--verify-cmd requires a command"
-      VERIFY_CMD="$2"
       shift 2
       ;;
     --self-test)
@@ -295,11 +261,6 @@ echo "Project: $PROJECT_DIR"
 echo "Scan mode: $SCAN_MODE"
 echo "Max rounds: $MAX_ROUNDS"
 echo "Output: $RUN_DIR"
-if [[ -n "$VERIFY_CMD" ]]; then
-  echo "Verify command: $VERIFY_CMD"
-else
-  echo "Verify command: not configured"
-fi
 
 previous_digest=""
 for ((round = 1; round <= MAX_ROUNDS; round++)); do
@@ -368,14 +329,9 @@ for ((round = 1; round <= MAX_ROUNDS; round++)); do
   echo "Finding fingerprint: $findings_digest"
 
   if [[ "$findings_count" == "0" ]]; then
-    if run_verification "$round"; then
-      printf '%s\n' "- result=pass" >> "$SUMMARY_FILE"
-      echo "PASS: no findings remain and verification passed/skipped."
-      exit 0
-    fi
-    printf '%s\n' "- result=verification_failed" >> "$SUMMARY_FILE"
-    echo "STOP: verification failed; this security-only Pi loop will not spend more scan tokens." >&2
-    exit 4
+    printf '%s\n' "- result=pass" >> "$SUMMARY_FILE"
+    echo "PASS: no findings remain."
+    exit 0
   fi
 
   if [[ -n "$previous_digest" && "$findings_digest" == "$previous_digest" ]]; then
