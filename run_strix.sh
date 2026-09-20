@@ -1077,8 +1077,12 @@ if [[ "$same_run_dir" -eq 1 ]]; then
   fi
 fi
 
+# Exit 124 means the timeout wrapper killed Strix at the deadline. When the
+# run itself confirmed completion (run.json scan_completed/success) and the
+# report/SARIF checks pass, the scan did finish and the timeout only raced
+# process shutdown, so it still counts as success.
 if [[ "$run_completed" -eq 1 && "$context_error" -eq 0 && "$runtime_error" -eq 0 && "$content_filter_error" -eq 0 && \
-      "$strix_exit" -eq 0 && "$sarif_valid" -eq 1 && "$same_run_dir" -eq 1 ]]; then
+      ( "$strix_exit" -eq 0 || "$strix_exit" -eq 124 ) && "$sarif_valid" -eq 1 && "$same_run_dir" -eq 1 ]]; then
   scan_status="success"
 elif [[ "$run_completed" -eq 1 && "$context_error" -eq 0 && "$runtime_error" -eq 0 && "$content_filter_error" -eq 0 && \
         "$strix_exit" -eq 2 && "$result_count" -gt 0 && \
@@ -1116,6 +1120,7 @@ echo "Normalized scan status: $scan_status"
 
 if [[ "$scan_status" != "success" ]]; then
   echo "Strix operational failure or incomplete scan; inspect local artifacts: $ARTIFACT_DIR" >&2
+  echo "View: strix view $ARTIFACT_DIR" >&2
   exit 1
 fi
 

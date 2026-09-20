@@ -189,6 +189,7 @@ PI_FIX_ALLOW_BREAKING=false \
 `scan-status.txt` 中的 `status=success` 表示脚本完成了报告、SARIF、运行状态和运行时错误校验：
 
 - `findings` 只统计真实发现，`coverage` 是 `strix-coverage/*` 覆盖项数量，`total_results` 是全部 SARIF result 数。
+- 若 Strix 因总超时被终止（`exit_code=124`），但 `run.json` 已确认扫描完成、报告和 SARIF 校验通过，仍记为 `success`；未确认完成即超时的扫描记为 `failure`，失败时也会打印 `strix view` 命令，便于查看已产出的结果。
 - 运行时错误校验优先读取 Strix 自带的 `strix.log`，interactive 和 `--auto` 模式都会执行；`run.json` 中的 `scan_results.scan_completed` / `success` 也会参与完成度判定（字段存在时）。
 - interactive TUI 的终端输出不会写进 `strix-console.log`；需要完整控制台日志时使用 `--auto`。
 - `run.json` 和 `strix.log` 会随结果一起复制出来，便于事后核对扫描完成度、批次中断和成本。
