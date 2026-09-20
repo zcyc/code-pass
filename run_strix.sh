@@ -571,6 +571,16 @@ sys.exit(rc)
 ' "$seconds" "$RUN_UI_MODE" "$@"
 }
 
+TTY_STATE=""
+if [[ "$RUN_UI_MODE" == "interactive" && -t 0 && -t 1 ]]; then
+  TTY_STATE="$(stty -g 2>/dev/null || true)"
+fi
+restore_tty() {
+  [[ -n "$TTY_STATE" ]] || return 0
+  stty "$TTY_STATE" 2>/dev/null || true
+  printf '\033[0m\033[?25h\033[?1l\033[?2004l' || true
+}
+
 
 if docker network inspect "$SANDBOX_NETWORK" >/dev/null 2>&1; then
   die "Job-specific Docker network already exists: $SANDBOX_NETWORK"
@@ -759,6 +769,7 @@ cleanup_workspace() {
 }
 
 cleanup_all() {
+  restore_tty
   cleanup_scope
   cleanup_sandbox
   cleanup_workspace
@@ -883,6 +894,7 @@ while (( attempt < max_attempts )); do
     cat "$ATTEMPT_LOG" >> "$SCAN_LOG"
     run_with_timeout "$remaining_seconds" "${execution_args[@]}"
     strix_exit=$?
+    restore_tty
     log_write_error=0
     printf 'Exit code: %s\nFinished: %s\n' \
       "$strix_exit" "$(date '+%Y-%m-%d %H:%M:%S %z')" >> "$ATTEMPT_LOG"

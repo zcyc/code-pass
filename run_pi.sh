@@ -350,6 +350,18 @@ fi
 [[ -f "$REPORT_FILE" && ! -L "$REPORT_FILE" ]] && pi_args+=("@$REPORT_FILE")
 pi_args+=("$(cat "$PROMPT_FILE")")
 
+# Interactive Pi may leave termios or ANSI state changed when it exits.
+TTY_STATE=""
+if [[ "$PI_MODE" == "interactive" && -t 0 && -t 1 ]]; then
+  TTY_STATE="$(stty -g 2>/dev/null || true)"
+fi
+restore_tty() {
+  [[ -n "$TTY_STATE" ]] || return 0
+  stty "$TTY_STATE" 2>/dev/null || true
+  printf '\033[0m\033[?25h\033[?1l\033[?2004l' || true
+}
+trap restore_tty EXIT
+
 # PI_TIMEOUT is opt-in: when unset, Pi runs directly with no script-level
 # deadline. When set, wrap Pi with a portable timeout that forwards signals and
 # works on macOS without GNU coreutils.
@@ -434,6 +446,7 @@ EOF_SUMMARY
     run_pi_bin "${pi_args[@]}"
   )
   pi_status=$?
+  restore_tty
 fi
 set -e
 
