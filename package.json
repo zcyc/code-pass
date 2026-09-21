@@ -1,0 +1,24 @@
+{
+  "name": "codepass",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension: bounded Strix scan → Pi fix → rescan loop",
+  "keywords": [
+    "pi-package",
+    "strix",
+    "security"
+  ],
+  "pi": {
+    "extensions": [
+      "extensions/strix-fix-loop.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": {
+    "check": "node scripts/self-check.ts"
+  }
+}

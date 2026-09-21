@@ -1,119 +1,176 @@
 # CodePass
 
-CodePass is a local, authorized source-code security workflow built around
-Strix and Pi. The Go CLI provides three commands:
+`/strix-fix-loop` for Pi — a local, authorized Strix scan → Pi fix → rescan loop
+that runs inside the current Pi session.
 
-1. `scan` copies a target project into an isolated, sanitized workspace and
-   runs a Strix scan.
-2. `fix` reads one explicitly selected Strix result, triages the findings with
-   Pi, and can fix confirmed issues.
-3. `run` orchestrates a bounded scan -> fix -> rescan loop.
+[中文说明](README.zh-CN.md)
 
-The CLI never commits, pushes, or deploys code automatically.
+## What it does
+
+One command, no scan artifacts to pass around:
+
+1. Copies the project into a sanitized temporary workspace.
+2. Runs a headless Strix scan in a per-round Docker network.
+3. Hands that round's `findings.sarif` and report to the current Pi agent for
+   triage and repair.
+4. Rescans and repeats until the loop stops.
+
+The extension never commits, pushes, or deploys code.
+
+| Stop condition | Result |
+| --- | --- |
+| Scan failed or incomplete | `scan_failed` |
+| No findings remain | `pass` |
+| Same finding fingerprint after a fix | `stalled` |
+| Pi made no repository change | `stalled` |
+| Round limit reached | `round_limit` |
+
+## Quick start
+
+```bash
+pi -e /path/to/codepass
+```
+
+```text
+/strix-fix-loop ~/src/my-app
+```
+
+No scan result directory is required: each round's results are located
+automatically and handed to the agent as soon as Strix finishes.
 
 ## Requirements
 
-- Go 1.22 or newer.
 - macOS or Linux.
-- Docker Engine or Docker Desktop with a running daemon.
-- Strix CLI 1.4.1 or newer, available as `strix`, or configured with
-  `STRIX_BIN`.
-- Pi CLI, available as `pi`, or configured with `PI_BIN`.
-- Git for the `run` workflow and Pi change tracking.
+- Docker Engine or Docker Desktop, daemon running.
+- Strix CLI 1.4.1+ — `strix` on `PATH`, `~/.strix/bin/strix`, or `STRIX_BIN`.
+- A Git worktree for the target project (change tracking).
+- Pi.
 
-Build the binary:
+## Install
 
-```bash
-go build -o codepass .
-```
+| Method | Command |
+| --- | --- |
+| Try it for one run | `pi -e /path/to/codepass` |
+| Install as a Pi package | `pi install /path/to/codepass` |
+| Global extension copy | `cp extensions/strix-fix-loop.ts ~/.pi/agent/extensions/` |
 
 ## Usage
 
-```bash
-./codepass scan --auto /path/to/project quick
-./codepass fix --auto /path/to/project /path/to/scan-result
-./codepass run --auto /path/to/project quick
+```text
+/strix-fix-loop [project-dir] [quick|standard|deep] [flags]
 ```
 
-`scan` is interactive by default. `fix` is interactive by default. `run` is
-automatic by default. Use `--interactive` or `--auto` to select explicitly.
-
-The scan result argument for `fix` must be a result directory containing
-`findings.sarif`, or that exact file. CodePass never guesses the latest scan.
-
-The default `run` loop has three rounds. It stops when a scan fails or is
-incomplete, no findings remain, Pi makes no change, the same finding
-fingerprint returns, or the round limit is reached.
-
-Read-only remediation:
-
-```bash
-PI_FIX_DRY_RUN=true ./codepass fix --auto /path/to/project /path/to/scan-result
+```text
+/strix-fix-loop                                      # current dir, quick, 3 rounds
+/strix-fix-loop ~/src/my-app standard
+/strix-fix-loop ~/src/my-app deep --max-rounds 2 --max-budget 20
+/strix-fix-loop ~/src/my-app --instruction "Focus on authentication"
+PI_FIX_DRY_RUN=true /strix-fix-loop ~/src/my-app     # read-only triage
 ```
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `-t`, `--target PATH` | current directory | Project directory |
+| `-m`, `--scan-mode MODE` | `quick` | `quick`, `standard`, or `deep` |
+| `--scope-mode MODE` | `full` | `auto`, `diff`, or `full` |
+| `--max-budget USD` | `50` | Total Strix budget, split across rounds |
+| `--max-turns N` | mode default | Maximum turns per Strix agent |
+| `--instruction TEXT` | unset | Extra Strix instruction |
+| `--instruction-file PATH` | unset | Instruction from a file (64 KiB limit) |
+| `--max-rounds N` | `3` | Maximum scan/fix rounds |
+| `--output-dir PATH` | `~/strix_runs` | Run output root, outside the project |
+| `--dry-run` | `false` | Read-only fix pass, no file edits |
+| `--keep-workspace` | `false` | Keep the sanitized scan workspace |
+| `-n`, `--non-interactive` | — | Accepted for compatibility; scans are headless |
+| `-h`, `--help` | — | Show help in the transcript |
 
 ## Environment
 
-Scan variables:
-
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `STRIX_BIN` | `strix` or `~/.strix/bin/strix` | Strix executable |
-| `STRIX_OUTPUT_DIR` | `~/strix_runs` | Scan output root, outside the target |
-| `STRIX_RUN_ID` | generated | Run identifier, ASCII letters/digits/`.`/`_`/`-`, max 48 chars |
-| `STRIX_RUN_UI_MODE` | `interactive` | `interactive` or `auto` |
+| `STRIX_BIN` | `strix` / `~/.strix/bin/strix` | Strix executable |
+| `STRIX_OUTPUT_DIR` | `~/strix_runs` | Run output root, outside the project |
 | `STRIX_SCAN_MODE` | `quick` | `quick`, `standard`, or `deep` |
-| `STRIX_MAX_BUDGET` | `50` | Total Strix budget |
-| `STRIX_TIMEOUT` | `9h30m` | Total scan timeout |
-| `STRIX_MAX_TURNS` | mode-dependent | Maximum turns per agent |
-| `STRIX_NETWORK_RETRIES` | `1` | Automatic-mode transport retries, `0` to `2` |
+| `STRIX_SCOPE_MODE` | `full` | `auto`, `diff`, or `full` |
+| `STRIX_MAX_BUDGET` / `STRIX_MAX_BUDGET_USD` | `50` | Total Strix budget |
+| `STRIX_MAX_TURNS` | mode default | Maximum turns per Strix agent |
+| `STRIX_TIMEOUT` | `9h30m` | Per-round scan timeout |
+| `STRIX_FIX_LOOP_MAX_ROUNDS` | `3` | Maximum scan/fix rounds |
 | `STRIX_KEEP_WORKSPACE` | `false` | Keep the temporary workspace |
 | `STRIX_FRONTEND_STATIC` | `false` | Force static-only analysis |
-
-Pi variables:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `PI_BIN` | `pi` | Pi executable |
-| `PI_OUTPUT_DIR` | `~/pi_runs` | Pi output root, outside the target and scan result |
-| `PI_FIX_DRY_RUN` | `false` | Use Pi read-only tools and do not modify files |
+| `STRIX_COORDINATION_OPTIMIZED` | `false` | Add coordination guidance to the scan instruction |
+| `STRIX_TOKEN_OPTIMIZED` | `false` | Add token-efficiency guidance to the scan instruction |
+| `STRIX_FAIL_ON_CONTEXT_ERROR` | `true` | Treat context-window errors as scan failure |
+| `STRIX_SANDBOX_CPUS` | `2` | Docker sandbox CPU limit |
+| `STRIX_SANDBOX_MEM_LIMIT` | `3g` | Docker sandbox memory limit |
+| `STRIX_SANDBOX_PIDS_LIMIT` | `1024` | Docker sandbox PID limit |
+| `STRIX_SANDBOX_SHM_SIZE` | `1g` | Docker sandbox shared-memory size |
+| `PI_FIX_DRY_RUN` | `false` | Read-only fix pass, no file edits |
 | `PI_FIX_ALLOW_BREAKING` | `true` | Allow necessary breaking fixes |
-| `PI_TIMEOUT` | unset | Optional Pi timeout |
 
-Loop variables:
+## How a round works
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `CODE_PASS_OUTPUT_DIR` | `~/code_pass_runs` | Loop output root |
-| `CODE_PASS_MAX_ROUNDS` | `3` | Maximum scan/fix rounds |
-| `CODE_PASS_MAX_TOTAL_BUDGET` | `STRIX_MAX_BUDGET` or `50` | Total Strix budget split across rounds |
-| `CODE_PASS_RUN_UI_MODE` | `auto` | `interactive` or `auto` |
+**Scan**
 
-## Safety and output
+- The project is copied under `TMPDIR`; `.git`, dot-files and dot-directories,
+  dependency and build directories, archives, media, and binaries are pruned so
+  Strix only sees source, scripts, configuration, dependency manifests,
+  database scripts, and text templates.
+- Each round gets its own Docker network (`strix-managed=true`), removed
+  afterwards; the sandbox is capped by the `STRIX_SANDBOX_*` limits.
+- Strix runs headless with `--scope-mode` and a defensive, local, read-only
+  instruction.
+- A scan counts as successful only when `run.json` proves completion, exactly
+  one `findings.sarif` and one `penetration_test_report.md` exist in the same
+  run, the SARIF parses, and no context-window, runtime, or content-filter
+  markers appear in the logs.
+
+**Fix**
+
+- The fix prompt goes to the current Pi session (`pi.sendUserMessage`) and the
+  loop waits for the turn to settle.
+- Changes are captured with a temporary Git index, so `changes.diff` also
+  includes untracked files.
+- `--dry-run` (or `PI_FIX_ALLOW_BREAKING=false`) keeps only read-only tools
+  active for that turn.
+
+## Output
+
+Each run is written to `<output>/<project>-<timestamp>-<pid>/`:
+
+```text
+~/strix_runs/my-app-20260921-162025-81334/
+├── summary.md                  # round-by-round log
+├── findings-round-N.txt        # stable finding fingerprints per round
+├── strix/round-N/
+│   ├── findings.sarif
+│   ├── penetration_test_report.md
+│   ├── run.json
+│   ├── instruction.md
+│   ├── scan-status.txt
+│   ├── strix.log
+│   └── strix-console.log
+└── pi/round-N/
+    ├── prompt.md
+    ├── git-status-before.txt
+    ├── git-status-after.txt
+    └── changes.diff
+```
+
+## Safety
 
 - Only scan projects you are authorized to inspect.
-- `scan` works on a sanitized copy and does not modify the original project.
-- `fix` may modify the selected project unless it is read-only.
-- Output directories must be outside the project being scanned.
-- Scan and Pi artifacts may contain source paths, vulnerability evidence, and
-  remediation details; keep them private.
-- No command automatically commits, pushes, deploys, or connects to a
-  production system.
-
-Common scan artifacts include `findings.sarif`,
-`penetration_test_report.md`, `vulnerabilities.json`, `coverage.json`,
-`vulnerabilities/`, `run.json`, `strix.log`, `scan-status.txt`, and attempt
-logs. Pi artifacts include `prompt.md`, `pi-summary.md`, `changes.diff`,
-`git-status-before.txt`, `git-status-after.txt`, and `metadata.txt`.
+- The scan works on a sanitized copy; only the fix phase touches the original
+  project.
+- No command commits, pushes, deploys, or connects to a production system.
+- Scan and Pi artifacts can contain source paths, vulnerability evidence, and
+  remediation details — keep them private.
 
 ## Development
 
 ```bash
-go test ./...
-go test -race ./...
-go vet ./...
-go run . self-test
+npm run check   # node scripts/self-check.ts
 ```
 
-Exit codes are `0` for success, `1` for operational failure, `2` for invalid
-arguments, and `3` when the bounded loop stops with findings or without
-progress.
+The self-check covers argument parsing, duration and budget handling, SARIF
+fingerprinting, pruning rules, `run.json` validation, and prompt construction.
