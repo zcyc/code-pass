@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 usage() {
   cat <<'USAGE'
 Usage:
-  run_code_pass.sh [--interactive|--auto] [--max-rounds N] \
+  codepass.sh [--interactive|--auto] [--max-rounds N] \
     <local-project-dir> [quick|standard|deep]
 
 The loop runs a bounded Strix scan -> Pi remediation cycle. It stops when:
@@ -19,14 +19,14 @@ The loop runs a bounded Strix scan -> Pi remediation cycle. It stops when:
   - the round limit is reached.
 
 Examples:
-  CODE_PASS_MAX_ROUNDS=2 ./run_code_pass.sh --auto ~/src/my-project
+  CODE_PASS_MAX_ROUNDS=2 ./codepass.sh --auto ~/src/my-project
 
 Environment:
   CODE_PASS_OUTPUT_DIR          Default: ~/code_pass_runs
   CODE_PASS_MAX_ROUNDS          Default: 3
   CODE_PASS_MAX_TOTAL_BUDGET    Total Strix budget split across rounds; defaults to STRIX_MAX_BUDGET or 50
   STRIX_MAX_BUDGET              Used as the total loop budget unless overridden above
-  PI_TIMEOUT                    Optional timeout passed through to run_pi.sh
+  PI_TIMEOUT                    Optional timeout passed through to pi.sh
 USAGE
 }
 
@@ -139,7 +139,7 @@ run_self_test() {
   second="$(parse_findings "$temp_dir/one.sarif" "$temp_dir/two.txt")"
   [[ "$first" == "$second" ]] || die "self-test fingerprint is not stable"
   [[ "$(wc -l < "$temp_dir/one.txt" | tr -d ' ')" == "1" ]] || die "self-test finding count is wrong"
-  echo "run_code_pass self-test: ok"
+  echo "codepass self-test: ok"
 }
 
 changed_paths_from_diff() {
@@ -174,7 +174,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --version)
-      echo "run_code_pass $VERSION"
+      echo "codepass $VERSION"
       exit 0
       ;;
     -h|--help)
@@ -213,8 +213,8 @@ esac
 }
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 command -v git >/dev/null 2>&1 || die "git is required"
-[[ -x "$SCRIPT_DIR/run_strix.sh" ]] || die "run_strix.sh is missing or not executable"
-[[ -x "$SCRIPT_DIR/run_pi.sh" ]] || die "run_pi.sh is missing or not executable"
+[[ -x "$SCRIPT_DIR/strix.sh" ]] || die "strix.sh is missing or not executable"
+[[ -x "$SCRIPT_DIR/pi.sh" ]] || die "pi.sh is missing or not executable"
 
 if [[ -n "$TOTAL_BUDGET" ]]; then
   python3 - "$TOTAL_BUDGET" <<'PY'
@@ -231,7 +231,7 @@ PROJECT_DIR="$(canonicalize_path "$PROJECT_ARG")" || die "cannot resolve project
 [[ "$PROJECT_DIR" != "/" ]] || die "refusing to operate on filesystem root"
 [[ "$PROJECT_DIR" != *$'\n'* ]] || die "project path must not contain a newline"
 git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
-  die "run_code_pass.sh requires a Git worktree for no-progress detection"
+  die "codepass.sh requires a Git worktree for no-progress detection"
 
 SCAN_MODE="${SCAN_MODE_ARG:-${STRIX_SCAN_MODE:-quick}}"
 case "$SCAN_MODE" in
@@ -281,12 +281,12 @@ for ((round = 1; round <= MAX_ROUNDS; round++)); do
       env STRIX_OUTPUT_DIR="$RUN_DIR/strix" \
         STRIX_RUN_ID="$scan_id" \
         STRIX_MAX_BUDGET="$round_budget" \
-        "$SCRIPT_DIR/run_strix.sh" --auto "$PROJECT_DIR" "$SCAN_MODE" \
+        "$SCRIPT_DIR/strix.sh" --auto "$PROJECT_DIR" "$SCAN_MODE" \
         >"$scan_log" 2>&1
     else
       env STRIX_OUTPUT_DIR="$RUN_DIR/strix" \
         STRIX_RUN_ID="$scan_id" \
-        "$SCRIPT_DIR/run_strix.sh" --auto "$PROJECT_DIR" "$SCAN_MODE" \
+        "$SCRIPT_DIR/strix.sh" --auto "$PROJECT_DIR" "$SCAN_MODE" \
         >"$scan_log" 2>&1
     fi
     scan_status_code=$?
@@ -296,11 +296,11 @@ for ((round = 1; round <= MAX_ROUNDS; round++)); do
       env STRIX_OUTPUT_DIR="$RUN_DIR/strix" \
         STRIX_RUN_ID="$scan_id" \
         STRIX_MAX_BUDGET="$round_budget" \
-        "$SCRIPT_DIR/run_strix.sh" --interactive "$PROJECT_DIR" "$SCAN_MODE"
+        "$SCRIPT_DIR/strix.sh" --interactive "$PROJECT_DIR" "$SCAN_MODE"
     else
       env STRIX_OUTPUT_DIR="$RUN_DIR/strix" \
         STRIX_RUN_ID="$scan_id" \
-        "$SCRIPT_DIR/run_strix.sh" --interactive "$PROJECT_DIR" "$SCAN_MODE"
+        "$SCRIPT_DIR/strix.sh" --interactive "$PROJECT_DIR" "$SCAN_MODE"
     fi
     scan_status_code=$?
   fi
@@ -354,13 +354,13 @@ for ((round = 1; round <= MAX_ROUNDS; round++)); do
   set +e
   if [[ "$RUN_MODE" == "auto" ]]; then
     env PI_OUTPUT_DIR="$pi_root" \
-      "$SCRIPT_DIR/run_pi.sh" --auto "$PROJECT_DIR" "$scan_dir" \
+      "$SCRIPT_DIR/pi.sh" --auto "$PROJECT_DIR" "$scan_dir" \
       >"$pi_log" 2>&1
     pi_status_code=$?
     cat "$pi_log"
   else
     env PI_OUTPUT_DIR="$pi_root" \
-      "$SCRIPT_DIR/run_pi.sh" --interactive "$PROJECT_DIR" "$scan_dir"
+      "$SCRIPT_DIR/pi.sh" --interactive "$PROJECT_DIR" "$scan_dir"
     pi_status_code=$?
   fi
   set -e

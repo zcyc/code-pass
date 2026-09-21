@@ -7,7 +7,7 @@ VERSION="1.3.1"
 usage() {
   cat <<'USAGE'
 Usage:
-  run_pi.sh [--interactive|--auto] <local-project-dir> <strix-scan-result>
+  pi.sh [--interactive|--auto] <local-project-dir> <strix-scan-result>
 
 Arguments:
   local-project-dir   Local repository Pi should modify.
@@ -42,10 +42,10 @@ Environment variables:
                          Unset by default: Pi runs without a script timeout.
 
 Examples:
-  ./run_pi.sh ~/src/my-project ~/strix_runs/my-project_0f73
-  ./run_pi.sh ~/src/my-project ~/strix_runs/my-project_0f73/findings.sarif
-  ./run_pi.sh --auto ~/src/my-project ~/strix_runs/my-project_0f73
-  PI_FIX_DRY_RUN=true ./run_pi.sh ~/src/my-project ~/strix_runs/my-project_0f73
+  ./pi.sh ~/src/my-project ~/strix_runs/my-project_0f73
+  ./pi.sh ~/src/my-project ~/strix_runs/my-project_0f73/findings.sarif
+  ./pi.sh --auto ~/src/my-project ~/strix_runs/my-project_0f73
+  PI_FIX_DRY_RUN=true ./pi.sh ~/src/my-project ~/strix_runs/my-project_0f73
 USAGE
 }
 die() {

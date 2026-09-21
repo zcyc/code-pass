@@ -7,7 +7,7 @@ RUN_STRIX_PIPELINE_VERSION="3.3.2-local"
 usage() {
   cat <<'EOF'
 Usage:
-  run_strix.sh [--interactive|--auto] <local-project-dir> [quick|standard|deep]
+  strix.sh [--interactive|--auto] <local-project-dir> [quick|standard|deep]
 
 Modes:
   --interactive  Start the normal Strix TUI (default). Keeps a real terminal so
@@ -16,10 +16,10 @@ Modes:
                  transient transport retry behavior used by the old CI runner.
 
 Examples:
-  ./run_strix.sh ~/src/my-project
-  ./run_strix.sh ~/src/my-project standard
-  ./run_strix.sh --auto ~/src/my-project quick
-  STRIX_MAX_BUDGET=30 ./run_strix.sh --auto /opt/code/api deep
+  ./strix.sh ~/src/my-project
+  ./strix.sh ~/src/my-project standard
+  ./strix.sh --auto ~/src/my-project quick
+  STRIX_MAX_BUDGET=30 ./strix.sh --auto /opt/code/api deep
 
 Results are written to ~/strix_runs/<project>-<timestamp>-<pid>/ by default.
 Override the output root with STRIX_OUTPUT_DIR.
