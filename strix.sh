@@ -149,7 +149,9 @@ readonly WORK_DIR
 # Ensure early validation/copy failures do not leave a temporary source copy.
 trap 'rm -rf "$WORK_DIR"' EXIT
 readonly TARGET_DIR="${WORK_DIR}/target"
-readonly STRIX_RUN_ROOT="${WORK_DIR}/strix_runs"
+# Strix writes its native results below the current working directory. Keep
+# that directory persistent so the view command it prints remains usable.
+readonly STRIX_RUN_ROOT="${ARTIFACT_DIR}/strix_runs"
 readonly STRIX_RUN_TOKEN="${WORK_DIR##*.}"
 
 _default_strix_bin="$(command -v strix 2>/dev/null || true)"
@@ -676,8 +678,9 @@ scope_base="strix-local-${RUN_ID}"
 scope_unit="${scope_base}.scope"
 scope_active=0
 network_active=0
-# Set once every artifact is safely in the output directory; until then the
-# scan workspace is never deleted, so a crash cannot cost the scan results.
+# Set once normalized artifacts are safely in the output directory. Native
+# Strix results already live there; retain the temporary source only when it
+# contains an additional recovery copy.
 artifacts_saved=0
 
 cleanup_scope() {
@@ -761,8 +764,8 @@ cleanup_workspace() {
     echo "Keeping local scan workspace: $WORK_DIR" >&2
     return
   fi
-  if [[ "$artifacts_saved" -ne 1 && ( -d "$TARGET_DIR/strix_runs" || -d "$STRIX_RUN_ROOT" ) ]]; then
-    echo "Scan results were not finalized; keeping local scan workspace for recovery: $WORK_DIR" >&2
+  if [[ "$artifacts_saved" -ne 1 && -d "$TARGET_DIR/strix_runs" ]]; then
+    echo "Scan results were not finalized; keeping local source workspace for recovery: $WORK_DIR" >&2
     return
   fi
   rm -rf "$WORK_DIR"
@@ -830,7 +833,10 @@ echo "=========================================="
 # expose --mount, while still leaving the user's original project untouched.
 source_args=(--target "$TARGET_DIR")
 echo "Source transfer: local sanitized copy via --target."
-cd "$WORK_DIR"
+# Strix stores native results in ./strix_runs. Run it from the persistent
+# artifact directory so its own view command still points at live files after
+# the temporary source workspace is removed.
+cd "$ARTIFACT_DIR"
 attempt=0
 scan_deadline=$((SECONDS + STRIX_TIMEOUT_SECONDS))
 # Interactive mode has one attempt because retrying would tear down its TUI;
@@ -1132,7 +1138,6 @@ echo "Normalized scan status: $scan_status"
 
 if [[ "$scan_status" != "success" ]]; then
   echo "Strix operational failure or incomplete scan; inspect local artifacts: $ARTIFACT_DIR" >&2
-  echo "View: strix view $ARTIFACT_DIR" >&2
   exit 1
 fi
 
@@ -1141,4 +1146,3 @@ echo "Results: $ARTIFACT_DIR"
 if [[ "$RUN_UI_MODE" == "interactive" ]]; then
   echo "NOTE: the interactive TUI transcript is not captured in strix-console.log; Strix's own strix.log and run.json are preserved in the result directory for diagnostics."
 fi
-echo "View: strix view $ARTIFACT_DIR"

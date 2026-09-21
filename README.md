@@ -98,6 +98,8 @@ By default, results are written to:
 
 The command prints the concrete result directory. Use that exact directory for the next step; do not guess the latest result by sorting directory names.
 
+Strix's native run data is kept under `<result-directory>/strix_runs/`, so the `strix view` command printed during the scan remains usable after `strix.sh` exits.
+
 ### Pi remediation
 
 ```text
