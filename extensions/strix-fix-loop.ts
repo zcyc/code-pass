@@ -2,7 +2,7 @@
  * /strix-fix-loop — bounded Strix scan → Pi fix → rescan loop.
  *
  * The extension owns the whole workflow inside the current Pi session:
- *   1. copy the project into a sanitized temporary workspace,
+ *   1. copy the project into a sanitized per-run workspace,
  *   2. run a headless Strix scan in a dedicated Docker network,
  *   3. hand the SARIF findings to the current agent for triage and repair,
  *   4. rescan and stop on pass, repeated findings, no change, failure, or round limit.
@@ -16,8 +16,8 @@ import { execFile, spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { createWriteStream, promises as fs } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { homedir } from "node:os";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   USAGE,
   budgetPerAttempt,
@@ -32,6 +32,7 @@ import {
   sanitizeName,
   sarifFindings,
   shouldPruneEntry,
+  tokenizeArgs,
   versionAtLeast,
   type LoopOptions,
 } from "./strix-core.ts";
@@ -40,6 +41,8 @@ const STATUS_KEY = "strix-fix-loop";
 const ENTRY_TYPE = "strix-fix-loop";
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const MIN_STRIX_VERSION: [number, number, number] = [1, 5, 2];
+const CHECKPOINT_FILE = "loop-state.json";
+const RESUME_USAGE = "Usage: /strix-resume <run-id> [--output-dir PATH]";
 
 const CONTEXT_ERROR_NEEDLES = [
   "context window",
@@ -93,6 +96,28 @@ interface RunState {
   dockerBin: string;
   roundBudget: string;
   instruction: string;
+  checkpoint: RunCheckpoint;
+  checkpointFile: string;
+}
+
+type RunPhase = "scan" | "prepare_fix" | "fix" | "fix_done" | "complete";
+type PersistedOptions = Omit<LoopOptions, "errors" | "help">;
+
+interface RunCheckpoint {
+  version: 1;
+  runId: string;
+  runDir: string;
+  project: string;
+  phase: RunPhase;
+  round: number;
+  previousDigest: string;
+  strixRunName: string | null;
+  options: PersistedOptions;
+  roundBudget: string;
+  instruction: string;
+  strixBinary: string;
+  piSessionFile: string | null;
+  baselineTree?: string;
 }
 
 interface RoundScan {
@@ -128,14 +153,21 @@ interface CaptureResult {
 }
 
 let loopRunning = false;
+let shuttingDown = false;
 const activeChildren = new Set<ChildProcess>();
 
 export default function strixFixLoop(pi: ExtensionAPI): void {
   pi.registerEntryRenderer<LoopEntry>(ENTRY_TYPE, renderLoopEntry);
 
   pi.on("session_shutdown", () => {
-    for (const child of activeChildren) killProcessTree(child, "SIGTERM");
-    activeChildren.clear();
+    shuttingDown = true;
+    for (const child of activeChildren) {
+      killProcessTree(child, "SIGTERM");
+      const forceKill = setTimeout(() => {
+        if (activeChildren.has(child)) killProcessTree(child, "SIGKILL");
+      }, 10_000);
+      forceKill.unref();
+    }
   });
 
   pi.registerCommand("strix-fix-loop", {
@@ -162,27 +194,182 @@ export default function strixFixLoop(pi: ExtensionAPI): void {
         ctx.ui.notify(`strix-fix-loop: ${options.errors[0]}`, "error");
         return;
       }
-      if (loopRunning) {
-        ctx.ui.notify("strix-fix-loop: a run is already active in this session", "warning");
-        return;
-      }
-      if (!ctx.isIdle()) {
-        ctx.ui.notify("strix-fix-loop: wait for the current turn to finish, then retry", "warning");
-        return;
-      }
-      loopRunning = true;
-      try {
-        await runStrixFixLoop(pi, ctx, options);
-      } catch (error) {
-        const text = messageOf(error);
-        appendLoopEntry(pi, { title: "strix-fix-loop: failed", lines: [text], tone: "error" });
-        ctx.ui.notify(`strix-fix-loop: ${text}`, "error");
-      } finally {
-        loopRunning = false;
-        ctx.ui.setStatus(STATUS_KEY, undefined);
-      }
+      await runGuardedCommand(pi, ctx, "strix-fix-loop", () => runStrixFixLoop(pi, ctx, options));
     },
   });
+
+  pi.registerCommand("strix-resume", {
+    description: "Resume an interrupted Strix scan and fix loop",
+    handler: async (rawArgs, ctx) => {
+      let args: ResumeArgs;
+      try {
+        args = parseResumeArgs(rawArgs);
+      } catch (error) {
+        appendLoopEntry(pi, {
+          title: "strix-resume: invalid arguments",
+          lines: [messageOf(error), RESUME_USAGE],
+          tone: "error",
+        });
+        ctx.ui.notify(`strix-resume: ${messageOf(error)}`, "error");
+        return;
+      }
+      if (args.help) {
+        appendLoopEntry(pi, { title: "strix-resume usage", lines: [RESUME_USAGE] });
+        ctx.ui.notify("strix-resume: usage added to the transcript", "info");
+        return;
+      }
+      await runGuardedCommand(pi, ctx, "strix-resume", () => resumeStrixFixLoop(pi, ctx, args));
+    },
+  });
+}
+
+interface ResumeArgs {
+  runId: string;
+  outputRoot?: string;
+  help: boolean;
+}
+
+function parseResumeArgs(raw: string): ResumeArgs {
+  const tokens = tokenizeArgs(raw);
+  let runId = "";
+  let outputRoot: string | undefined;
+  let help = false;
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token === "-h" || token === "--help") {
+      help = true;
+      continue;
+    }
+    if (token === "--output-dir") {
+      outputRoot = tokens[++index];
+      if (outputRoot === undefined || outputRoot.startsWith("-")) {
+        throw new Error("--output-dir requires a path");
+      }
+      continue;
+    }
+    if (token.startsWith("--output-dir=")) {
+      outputRoot = token.slice("--output-dir=".length);
+      if (outputRoot === "") throw new Error("--output-dir requires a path");
+      continue;
+    }
+    if (token.startsWith("-") || runId !== "") throw new Error(`unexpected argument: ${token}`);
+    runId = token;
+  }
+  if (!help && runId === "") throw new Error("run-id is required");
+  if (runId !== "" && !/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(runId)) {
+    throw new Error("run-id must be a simple run directory name");
+  }
+  return { runId, outputRoot, help };
+}
+
+function persistedOptions(options: LoopOptions): PersistedOptions {
+  const persisted = { ...options } as Partial<LoopOptions>;
+  delete persisted.errors;
+  delete persisted.help;
+  return persisted as PersistedOptions;
+}
+
+function currentSessionFile(ctx: ExtensionCommandContext): string | null {
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  return sessionFile == null ? null : resolve(sessionFile);
+}
+
+async function findRunOutputRoots(
+  ctx: ExtensionCommandContext,
+  args: ResumeArgs,
+): Promise<string[]> {
+  if (args.outputRoot !== undefined) return [await canonicalPath(expandHome(args.outputRoot))];
+
+  const sessionManager = ctx.sessionManager as unknown as {
+    getBranch?: () => Array<{ customType?: string; data?: unknown }>;
+  };
+  const roots = new Set<string>();
+  for (const entry of sessionManager.getBranch?.() ?? []) {
+    if (entry.customType !== ENTRY_TYPE || entry.data === null || typeof entry.data !== "object") continue;
+    const data = entry.data as { title?: unknown; lines?: unknown };
+    if (data.title !== `strix-fix-loop ${args.runId}` || !Array.isArray(data.lines)) continue;
+    for (const line of data.lines) {
+      if (typeof line !== "string" || !line.startsWith("output: ")) continue;
+      const runDir = resolve(line.slice("output: ".length));
+      if (basename(runDir) === args.runId) roots.add(await canonicalPath(dirname(runDir)));
+    }
+  }
+  if (roots.size > 0) return [...roots];
+  return [await canonicalPath(expandHome(process.env.STRIX_OUTPUT_DIR || "~/strix_runs"))];
+}
+
+function parseCheckpoint(value: unknown): RunCheckpoint {
+  if (value === null || typeof value !== "object") throw new Error("checkpoint is not a JSON object");
+  const data = value as Record<string, unknown>;
+  const phases: RunPhase[] = ["scan", "prepare_fix", "fix", "fix_done", "complete"];
+  if (data.version !== 1 || !phases.includes(data.phase as RunPhase)) {
+    throw new Error("unsupported or invalid checkpoint version/phase");
+  }
+  if (
+    typeof data.runId !== "string" || typeof data.runDir !== "string" ||
+    typeof data.project !== "string" || typeof data.round !== "number" ||
+    !Number.isInteger(data.round) || data.round < 1 ||
+    typeof data.previousDigest !== "string" ||
+    !(data.strixRunName === null || typeof data.strixRunName === "string") ||
+    data.options === null || typeof data.options !== "object" || Array.isArray(data.options) ||
+    typeof data.roundBudget !== "string" || typeof data.instruction !== "string" ||
+    typeof data.strixBinary !== "string" ||
+    !(data.piSessionFile === null || typeof data.piSessionFile === "string")
+  ) {
+    throw new Error("checkpoint is missing required fields");
+  }
+  if (
+    !isAbsolute(data.runDir) || !isAbsolute(data.project) ||
+    (typeof data.strixRunName === "string" &&
+      (data.strixRunName === "" || data.strixRunName === "." || data.strixRunName === ".." || basename(data.strixRunName) !== data.strixRunName)) ||
+    (data.baselineTree !== undefined &&
+      (typeof data.baselineTree !== "string" ||
+        (data.baselineTree !== "" && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(data.baselineTree))))
+  ) {
+    throw new Error("checkpoint contains an invalid path or Strix run name");
+  }
+  return data as unknown as RunCheckpoint;
+}
+
+async function writeCheckpoint(state: RunState): Promise<void> {
+  const temporary = `${state.checkpointFile}.tmp`;
+  await fs.writeFile(temporary, `${JSON.stringify(state.checkpoint, null, 2)}\n`, { mode: 0o600 });
+  await fs.rename(temporary, state.checkpointFile);
+}
+
+async function readSummaryLines(path: string): Promise<string[]> {
+  try {
+    return (await fs.readFile(path, "utf8")).split(/\r?\n/).filter((line) => line !== "");
+  } catch {
+    return [];
+  }
+}
+
+async function runGuardedCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  command: string,
+  run: () => Promise<void>,
+): Promise<void> {
+  if (loopRunning) {
+    ctx.ui.notify("strix-fix-loop: a run is already active in this session", "warning");
+    return;
+  }
+  if (!ctx.isIdle()) {
+    ctx.ui.notify("strix-fix-loop: wait for the current turn to finish, then retry", "warning");
+    return;
+  }
+  loopRunning = true;
+  try {
+    await run();
+  } catch (error) {
+    const text = messageOf(error);
+    appendLoopEntry(pi, { title: `${command}: failed`, lines: [text], tone: "error" });
+    ctx.ui.notify(`${command}: ${text}`, "error");
+  } finally {
+    loopRunning = false;
+    ctx.ui.setStatus(STATUS_KEY, undefined);
+  }
 }
 
 function renderLoopEntry(entry: { data?: LoopEntry }, options: { expanded: boolean }, theme: {
@@ -227,8 +414,6 @@ async function runStrixFixLoop(pi: ExtensionAPI, ctx: ExtensionCommandContext, o
 
   const outputRoot = await canonicalPath(expandHome(options.outputRoot));
   requireOutside(project, outputRoot, "output directory");
-  const tempRoot = await canonicalPath(tmpdir());
-  requireOutside(project, tempRoot, "TMPDIR");
   await fs.mkdir(outputRoot, { recursive: true, mode: 0o700 });
 
   const strixBin = await resolveStrixBinary(options.strixBin);
@@ -255,6 +440,21 @@ async function runStrixFixLoop(pi: ExtensionAPI, ctx: ExtensionCommandContext, o
   await fs.mkdir(join(runDir, "pi"), { recursive: true, mode: 0o700 });
   const summaryFile = join(runDir, "summary.md");
   await fs.writeFile(summaryFile, `# strix-fix-loop ${runId}\n\n`, { mode: 0o600 });
+  const checkpoint: RunCheckpoint = {
+    version: 1,
+    runId,
+    runDir,
+    project,
+    phase: "scan",
+    round: 1,
+    previousDigest: "",
+    strixRunName: null,
+    options: persistedOptions(options),
+    roundBudget,
+    instruction,
+    strixBinary: strixBin,
+    piSessionFile: currentSessionFile(ctx),
+  };
 
   const state: RunState = {
     pi,
@@ -269,10 +469,13 @@ async function runStrixFixLoop(pi: ExtensionAPI, ctx: ExtensionCommandContext, o
     dockerBin: "docker",
     roundBudget,
     instruction,
+    checkpoint,
+    checkpointFile: join(runDir, CHECKPOINT_FILE),
   };
+  await writeCheckpoint(state);
 
   progress(state, `run ${runId}: starting`);
-  appendLoopEntry(pi, {
+  appendLoopEntry(state.pi, {
     title: `strix-fix-loop ${runId}`,
     lines: [
       `project: ${project}`,
@@ -283,23 +486,110 @@ async function runStrixFixLoop(pi: ExtensionAPI, ctx: ExtensionCommandContext, o
   });
 
   const outcome = await executeRounds(state);
+  if (outcome.kind !== "scan_failed") {
+    state.checkpoint.phase = "complete";
+    await writeCheckpoint(state);
+  }
+  await reportOutcome(state, outcome);
+}
+
+async function resumeStrixFixLoop(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  args: ResumeArgs,
+): Promise<void> {
+  const sessionFile = currentSessionFile(ctx);
+  if (sessionFile === null) throw new Error("cannot resume from an ephemeral Pi session; use a persistent session");
+  const outputRoots = await findRunOutputRoots(ctx, args);
+  const matches: string[] = [];
+  for (const outputRoot of outputRoots) {
+    const candidate = join(outputRoot, args.runId);
+    if (await pathExists(join(candidate, CHECKPOINT_FILE))) matches.push(await canonicalPath(candidate));
+  }
+  const uniqueMatches = [...new Set(matches)];
+  if (uniqueMatches.length === 0) {
+    throw new Error(`no checkpoint found for ${args.runId}; pass --output-dir if the run uses a custom output root`);
+  }
+  if (uniqueMatches.length > 1) {
+    throw new Error(`multiple runs named ${args.runId} were found; specify --output-dir`);
+  }
+
+  const runDir = uniqueMatches[0];
+  const checkpointFile = join(runDir, CHECKPOINT_FILE);
+  const checkpoint = parseCheckpoint(JSON.parse(await fs.readFile(checkpointFile, "utf8")));
+  if (checkpoint.runId !== args.runId || resolve(checkpoint.runDir) !== runDir) {
+    throw new Error(`checkpoint identity does not match run-id ${args.runId}`);
+  }
+  if (checkpoint.piSessionFile === null || resolve(checkpoint.piSessionFile) !== sessionFile) {
+    throw new Error("this run belongs to a different Pi session; resume the original session with pi --continue");
+  }
+  if (checkpoint.phase === "complete") throw new Error(`run ${args.runId} is already complete`);
+
+  const project = await canonicalPath(checkpoint.project);
+  if (project !== checkpoint.project) throw new Error("project path changed since this run started");
+  const gitCheck = await execCapture("git", ["rev-parse", "--is-inside-work-tree"], { cwd: project });
+  if (gitCheck.code !== 0 || gitCheck.stdout.trim() !== "true") {
+    throw new Error(`project is no longer a Git worktree: ${project}`);
+  }
+  requireOutside(project, runDir, "run directory");
+  await inspectDocker();
+  const strixBin = await resolveStrixBinary(checkpoint.strixBinary);
+  const options: LoopOptions = { ...checkpoint.options, help: false, errors: [] };
+  const summaryFile = join(runDir, "summary.md");
+  const state: RunState = {
+    pi,
+    ctx,
+    options,
+    project,
+    runId: checkpoint.runId,
+    runDir,
+    summaryFile,
+    summaryLines: await readSummaryLines(summaryFile),
+    strixBin,
+    dockerBin: "docker",
+    roundBudget: checkpoint.roundBudget,
+    instruction: checkpoint.instruction,
+    checkpoint,
+    checkpointFile,
+  };
+
+  appendLoopEntry(pi, {
+    title: `strix-fix-loop ${args.runId}: resuming`,
+    lines: [`phase: ${checkpoint.phase}, round: ${checkpoint.round}`, `output: ${runDir}`],
+  });
+  progress(state, `resuming ${checkpoint.phase} at round ${checkpoint.round}`);
+  const outcome = await executeRounds(state);
+  if (outcome.kind !== "scan_failed") {
+    state.checkpoint.phase = "complete";
+    await writeCheckpoint(state);
+  }
+  await reportOutcome(state, outcome);
+}
+
+async function reportOutcome(state: RunState, outcome: LoopOutcome): Promise<void> {
+  if (state.checkpoint.phase === "complete") {
+    const fixDir = join(state.runDir, "pi", `round-${state.checkpoint.round}`);
+    await cleanupIndex(join(fixDir, "git-index-before"));
+    await cleanupIndex(join(fixDir, "git-index-after"));
+  }
   await addSummary(state, `- result=${outcome.kind}`);
   const tail = state.summaryLines.slice(-10);
-  appendLoopEntry(pi, {
+  appendLoopEntry(state.pi, {
     title: `strix-fix-loop: ${outcome.kind}`,
-    lines: [...tail, `artifacts: ${runDir}`],
+    lines: [...tail, `artifacts: ${state.runDir}`],
     tone: outcome.kind === "pass" ? "success" : "warning",
   });
-  ctx.ui.notify(`strix-fix-loop: ${outcome.message}`, outcome.kind === "pass" ? "info" : "warning");
+  state.ctx.ui.notify(`strix-fix-loop: ${outcome.message}`, outcome.kind === "pass" ? "info" : "warning");
 }
 
 async function executeRounds(state: RunState): Promise<LoopOutcome> {
-  let previousDigest = "";
-  for (let round = 1; round <= state.options.maxRounds; round++) {
+  let previousDigest = state.checkpoint.previousDigest;
+  for (let round = state.checkpoint.round; round <= state.options.maxRounds; round++) {
+    const resumingFix = ["prepare_fix", "fix", "fix_done"].includes(state.checkpoint.phase);
     progress(state, `round ${round}/${state.options.maxRounds}: Strix ${state.options.scanMode} scan`);
     let scan: RoundScan;
     try {
-      scan = await scanRound(state, round);
+      scan = resumingFix ? await loadCompletedScan(state, round) : await scanRound(state, round);
     } catch (error) {
       await addSummary(state, `- round=${round} status=scan_error`);
       return { kind: "scan_failed", message: `round ${round}: Strix failed to run: ${messageOf(error)}` };
@@ -320,22 +610,31 @@ async function executeRounds(state: RunState): Promise<LoopOutcome> {
         `artifacts: ${scan.scanDir}`,
       ],
     });
-    if (scan.findings === 0) {
+    if (!resumingFix && scan.findings === 0) {
       return { kind: "pass", message: `no findings remain after ${round} round(s)` };
     }
-    if (previousDigest !== "" && scan.digest === previousDigest) {
+    if (!resumingFix && previousDigest !== "" && scan.digest === previousDigest) {
       return {
         kind: "stalled",
         message: "the same findings returned after remediation; stopping before spending more budget",
       };
     }
-    previousDigest = scan.digest;
-    if (round === state.options.maxRounds) {
+    if (!resumingFix && round === state.options.maxRounds) {
       return { kind: "round_limit", message: `maximum rounds reached with ${scan.findings} finding(s) remaining` };
     }
 
-    progress(state, `round ${round}/${state.options.maxRounds}: Pi triage and fix`);
-    const fix = await fixRound(state, round, scan);
+    let fix: RoundFix;
+    if (state.checkpoint.phase === "fix_done") {
+      fix = await loadCompletedFix(state, round);
+    } else {
+      const resumingAgent = state.checkpoint.phase === "fix";
+      state.checkpoint.phase = "prepare_fix";
+      state.checkpoint.round = round;
+      state.checkpoint.previousDigest = previousDigest;
+      await writeCheckpoint(state);
+      progress(state, `round ${round}/${state.options.maxRounds}: Pi triage and fix`);
+      fix = await fixRound(state, round, scan, resumingAgent);
+    }
     await addSummary(state, `- round=${round} pi_changed_files=${fix.changedPaths.length}`);
     if (!fix.baselineAvailable) {
       return { kind: "fix_unavailable", message: `cannot compute the round ${round} change baseline; inspect ${fix.fixDir}` };
@@ -352,6 +651,15 @@ async function executeRounds(state: RunState): Promise<LoopOutcome> {
       ],
       tone: "success",
     });
+    previousDigest = scan.digest;
+    state.checkpoint.phase = "scan";
+    state.checkpoint.round = round + 1;
+    state.checkpoint.previousDigest = previousDigest;
+    state.checkpoint.strixRunName = null;
+    delete state.checkpoint.baselineTree;
+    await writeCheckpoint(state);
+    await cleanupIndex(join(fix.fixDir, "git-index-before"));
+    await cleanupIndex(join(fix.fixDir, "git-index-after"));
   }
   return { kind: "round_limit", message: "maximum rounds reached" };
 }
@@ -359,32 +667,55 @@ async function executeRounds(state: RunState): Promise<LoopOutcome> {
 async function scanRound(state: RunState, round: number): Promise<RoundScan> {
   const roundDir = join(state.runDir, "strix", `round-${round}`);
   await fs.mkdir(roundDir, { recursive: true, mode: 0o700 });
-  const workRoot = await fs.mkdtemp(join(tmpdir(), `strix-fix-loop-${state.runId}-${round}.`));
+  const workRoot = join(roundDir, "workspace");
   const targetDir = join(workRoot, "target");
   const network = `strix-fix-loop-${sanitizeName(state.runId, 40)}-${round}`;
   const consoleLog = join(roundDir, "strix-console.log");
   let networkCreated = false;
+  let scanStatus: RoundScan["status"] | undefined;
   try {
-    progress(state, `round ${round}/${state.options.maxRounds}: copying and sanitizing the project`);
-    await fs.cp(state.project, targetDir, { recursive: true, dereference: false, verbatimSymlinks: true });
-    await fs.rm(join(targetDir, ".git"), { recursive: true, force: true });
-    const pruned = await pruneTree(targetDir);
-    await addSummary(state, `- round=${round} pruned_dirs=${pruned.directories} pruned_files=${pruned.files}`);
-    await fs.writeFile(join(roundDir, "instruction.md"), state.instruction, { mode: 0o600 });
+    const runName = state.checkpoint.strixRunName ?? await findStrixRunName(roundDir);
+    const strixRunDir = runName === null ? null : join(roundDir, "strix_runs", runName);
+    if (strixRunDir !== null && await isCompletedStrixRun(strixRunDir)) {
+      await copyRunArtifacts(strixRunDir, roundDir);
+      const finalized = await finalizeRound(state, round, roundDir, targetDir, 0);
+      scanStatus = finalized.status;
+      return finalized;
+    }
+
+    if (runName === null) {
+      await fs.rm(workRoot, { recursive: true, force: true });
+      await fs.mkdir(workRoot, { recursive: true, mode: 0o700 });
+      progress(state, `round ${round}/${state.options.maxRounds}: copying and sanitizing the project`);
+      await fs.cp(state.project, targetDir, { recursive: true, dereference: false, verbatimSymlinks: true });
+      await fs.rm(join(targetDir, ".git"), { recursive: true, force: true });
+      const pruned = await pruneTree(targetDir);
+      await addSummary(state, `- round=${round} pruned_dirs=${pruned.directories} pruned_files=${pruned.files}`);
+      await fs.writeFile(join(roundDir, "instruction.md"), state.instruction, { mode: 0o600 });
+    } else {
+      if (!(await pathExists(targetDir))) throw new Error(`Strix target workspace is missing: ${targetDir}`);
+      if (!(await pathExists(join(strixRunDir!, ".state", "agents.json")))) {
+        throw new Error(`Strix run ${runName} has no resumable .state/agents.json checkpoint`);
+      }
+      state.checkpoint.strixRunName = runName;
+      await writeCheckpoint(state);
+    }
 
     progress(state, `round ${round}/${state.options.maxRounds}: preparing Strix Docker network`);
     await createNetwork(state.dockerBin, network);
     networkCreated = true;
 
-    const args = [
-      "-n",
-      "--target", targetDir,
-      "--scan-mode", state.options.scanMode,
-      "--scope-mode", state.options.scopeMode,
-      "--max-budget", state.roundBudget,
-      "--max-turns", String(state.options.maxTurns),
-      "--instruction", state.instruction,
-    ];
+    const args = runName === null
+      ? [
+          "-n",
+          "--target", targetDir,
+          "--scan-mode", state.options.scanMode,
+          "--scope-mode", state.options.scopeMode,
+          "--max-budget", state.roundBudget,
+          "--max-turns", String(state.options.maxTurns),
+          "--instruction", state.instruction,
+        ]
+      : ["-n", "--resume", runName];
     progress(state, `round ${round}/${state.options.maxRounds}: Strix ${state.options.scanMode} scan running`);
     let lastStatusUpdate = 0;
     const { code, timedOut } = await spawnLogged(state.strixBin, args, {
@@ -399,16 +730,51 @@ async function scanRound(state: RunState, round: number): Promise<RoundScan> {
         progress(state, `round ${round} Strix: ${line.slice(0, 140)}`);
       },
     });
-    return await finalizeRound(state, round, roundDir, targetDir, timedOut ? 124 : code);
+    const discoveredRunName = await findStrixRunName(roundDir);
+    if (discoveredRunName !== null) {
+      state.checkpoint.strixRunName = discoveredRunName;
+      await writeCheckpoint(state);
+    }
+    const finalized = await finalizeRound(state, round, roundDir, targetDir, timedOut ? 124 : code);
+    scanStatus = finalized.status;
+    return finalized;
   } finally {
     if (networkCreated && !(await removeNetwork(state.dockerBin, network))) {
       await addSummary(state, `- round=${round} warning=docker_network_not_removed name=${network}`);
     }
-    if (state.options.keepWorkspace) {
+    if (state.options.keepWorkspace || shuttingDown || scanStatus === "failure") {
       await addSummary(state, `- round=${round} workspace=${workRoot}`);
-    } else {
+    } else if (scanStatus === "success") {
       await fs.rm(workRoot, { recursive: true, force: true });
     }
+  }
+}
+
+async function loadCompletedScan(state: RunState, round: number): Promise<RoundScan> {
+  const roundDir = join(state.runDir, "strix", `round-${round}`);
+  const scan = await finalizeRound(state, round, roundDir, join(roundDir, "workspace", "target"), 0);
+  if (scan.status !== "success") throw new Error(scan.error ?? `completed scan artifacts are invalid: ${roundDir}`);
+  return scan;
+}
+
+async function findStrixRunName(roundDir: string): Promise<string | null> {
+  let entries;
+  try {
+    entries = await fs.readdir(join(roundDir, "strix_runs"), { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const runNames = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+  if (runNames.length > 1) throw new Error(`multiple Strix runs exist in ${join(roundDir, "strix_runs")}; cannot choose a resume target`);
+  return runNames[0] ?? null;
+}
+
+async function isCompletedStrixRun(runDir: string): Promise<boolean> {
+  try {
+    const runJson = JSON.parse(await fs.readFile(join(runDir, "run.json"), "utf8"));
+    return completedRunError(runJson) === null;
+  } catch {
+    return false;
   }
 }
 
@@ -421,8 +787,12 @@ async function finalizeRound(
 ): Promise<RoundScan> {
   const sarifs = await findFilesNamed([roundDir, targetDir], "findings.sarif");
   const reports = await findFilesNamed([roundDir, targetDir], "penetration_test_report.md");
-  let sarifPath = sarifs.length === 1 ? sarifs[0] : "";
-  let reportPath = reports.length === 1 ? reports[0] : "";
+  let sarifPath = await pathExists(join(roundDir, "findings.sarif"))
+    ? join(roundDir, "findings.sarif")
+    : sarifs.length === 1 ? sarifs[0] : "";
+  let reportPath = await pathExists(join(roundDir, "penetration_test_report.md"))
+    ? join(roundDir, "penetration_test_report.md")
+    : reports.length === 1 ? reports[0] : "";
   let artifactsDir = sarifPath === "" ? roundDir : dirname(sarifPath);
 
   if (sarifPath !== "" && artifactsDir !== roundDir) {
@@ -517,7 +887,7 @@ async function finalizeRound(
   };
 }
 
-async function fixRound(state: RunState, round: number, scan: RoundScan): Promise<RoundFix> {
+async function fixRound(state: RunState, round: number, scan: RoundScan, resumingAgent: boolean): Promise<RoundFix> {
   const fixDir = join(state.runDir, "pi", `round-${round}`);
   await fs.mkdir(fixDir, { recursive: true, mode: 0o700 });
   const statusAfterPath = join(fixDir, "git-status-after.txt");
@@ -525,22 +895,33 @@ async function fixRound(state: RunState, round: number, scan: RoundScan): Promis
   const baselineIndex = join(fixDir, "git-index-before");
   const afterIndex = join(fixDir, "git-index-after");
 
-  await fs.writeFile(join(fixDir, "git-status-before.txt"), await gitStatus(state.project), { mode: 0o600 });
   let baselineTree = "";
-  try {
-    baselineTree = await indexTree(state.project, baselineIndex);
-  } catch (error) {
-    await addSummary(state, `- round=${round} baseline_error=${messageOf(error)}`);
-  }
+  let prompt: string;
+  if (resumingAgent) {
+    baselineTree = state.checkpoint.baselineTree ?? "";
+    prompt = `继续第 ${round} 轮中断的 Strix 修复。先阅读 ${join(fixDir, "prompt.md")}，检查当前工作树和会话历史，识别已经完成的修复，只继续未完成部分；不要重复覆盖已完成的修改。`;
+    state.checkpoint.phase = "fix";
+    await writeCheckpoint(state);
+  } else {
+    await fs.writeFile(join(fixDir, "git-status-before.txt"), await gitStatus(state.project), { mode: 0o600 });
+    try {
+      baselineTree = await indexTree(state.project, baselineIndex);
+    } catch (error) {
+      await addSummary(state, `- round=${round} baseline_error=${messageOf(error)}`);
+    }
 
-  const prompt = buildFixPrompt({
-    project: state.project,
-    sarif: scan.sarif,
-    report: scan.report,
-    dryRun: state.options.dryRun,
-    allowBreaking: state.options.allowBreaking,
-  });
-  await fs.writeFile(join(fixDir, "prompt.md"), prompt, { mode: 0o600 });
+    prompt = buildFixPrompt({
+      project: state.project,
+      sarif: scan.sarif,
+      report: scan.report,
+      dryRun: state.options.dryRun,
+      allowBreaking: state.options.allowBreaking,
+    });
+    await fs.writeFile(join(fixDir, "prompt.md"), prompt, { mode: 0o600 });
+    state.checkpoint.phase = "fix";
+    state.checkpoint.baselineTree = baselineTree;
+    await writeCheckpoint(state);
+  }
 
   const readOnly = state.options.dryRun || !state.options.allowBreaking;
   const savedTools = state.pi.getActiveTools();
@@ -558,8 +939,8 @@ async function fixRound(state: RunState, round: number, scan: RoundScan): Promis
   let baselineAvailable = baselineTree !== "";
   if (baselineTree !== "") {
     try {
-      const afterTree = await indexTree(state.project, afterIndex);
-      const env = await gitIndexEnvironment(state.project, afterIndex);
+      await indexTree(state.project, afterIndex);
+      const env = await gitIndexEnvironment(state.project, afterIndex, [`${baselineIndex}.objects`]);
       const diff = await execCapture(
         "git",
         ["diff", "--cached", "--no-ext-diff", "--binary", baselineTree, "--"],
@@ -575,10 +956,23 @@ async function fixRound(state: RunState, round: number, scan: RoundScan): Promis
     diffText = "# Baseline diff unavailable; inspect git-status-before.txt and git-status-after.txt.\n";
   }
   await fs.writeFile(diffPath, diffText, { mode: 0o600 });
-  await cleanupIndex(baselineIndex);
-  await cleanupIndex(afterIndex);
+  state.checkpoint.phase = "fix_done";
+  state.checkpoint.baselineTree = baselineTree;
+  await writeCheckpoint(state);
 
   return { fixDir, diffPath, baselineAvailable, changedPaths: changedPaths(diffText) };
+}
+
+async function loadCompletedFix(state: RunState, round: number): Promise<RoundFix> {
+  const fixDir = join(state.runDir, "pi", `round-${round}`);
+  const diffPath = join(fixDir, "changes.diff");
+  const diffText = await fs.readFile(diffPath, "utf8");
+  return {
+    fixDir,
+    diffPath,
+    baselineAvailable: (state.checkpoint.baselineTree ?? "") !== "" && !diffText.startsWith("#"),
+    changedPaths: changedPaths(diffText),
+  };
 }
 
 /**
@@ -764,7 +1158,7 @@ async function resolveStrixBinary(configured: string): Promise<string> {
     const help = await tryExecCapture(candidate, ["--help"]);
     if (help === null || help.code !== 0) throw new Error(`cannot read Strix CLI help: ${candidate}`);
     const helpText = `${help.stdout}\n${help.stderr}`;
-    for (const required of ["--scan-mode", "--scope-mode", "--max-budget", "--max-turns", "--instruction"]) {
+    for (const required of ["--scan-mode", "--scope-mode", "--max-budget", "--max-turns", "--instruction", "--resume"]) {
       if (!helpText.includes(required)) throw new Error(`Strix does not support required option: ${required}`);
     }
     return candidate;
@@ -796,7 +1190,15 @@ async function createNetwork(dockerBin: string, name: string): Promise<void> {
   const existing = await execCapture(dockerBin, [
     "network", "ls", "--filter", `name=^${name}$`, "--format", "{{.Name}}",
   ]);
-  if (existing.stdout.trim() !== "") throw new Error(`job-specific Docker network already exists: ${name}`);
+  if (existing.stdout.trim() !== "") {
+    const labels = await execCapture(dockerBin, [
+      "network", "inspect", "--format", '{{ index .Labels "strix-managed" }}', name,
+    ]);
+    if (labels.code !== 0 || labels.stdout.trim() !== "true") {
+      throw new Error(`Docker network already exists and is not managed by this extension: ${name}`);
+    }
+    return;
+  }
   const created = await execCapture(dockerBin, ["network", "create", "--label", "strix-managed=true", name]);
   if (created.code !== 0) {
     throw new Error(`docker network create failed: ${created.stderr.trim() || created.stdout.trim()}`);
@@ -817,14 +1219,18 @@ async function gitStatus(project: string): Promise<string> {
   return result.code === 0 ? result.stdout : "";
 }
 
-async function gitIndexEnvironment(project: string, indexPath: string): Promise<NodeJS.ProcessEnv> {
+async function gitIndexEnvironment(
+  project: string,
+  indexPath: string,
+  additionalObjectDirs: string[] = [],
+): Promise<NodeJS.ProcessEnv> {
   const objectDir = `${indexPath}.objects`;
   await fs.mkdir(objectDir, { recursive: true, mode: 0o700 });
   const gitPath = (await execCapture("git", ["rev-parse", "--git-path", "objects"], { cwd: project })).stdout.trim();
   const gitObjectDir = isAbsolute(gitPath) ? gitPath : join(project, gitPath);
   return {
     ...process.env,
-    GIT_ALTERNATE_OBJECT_DIRECTORIES: gitObjectDir,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: [gitObjectDir, ...additionalObjectDirs].join(delimiter),
     GIT_INDEX_FILE: indexPath,
     GIT_OBJECT_DIRECTORY: objectDir,
   };

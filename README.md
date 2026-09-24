@@ -68,6 +68,14 @@ automatically and handed to the agent as soon as Strix finishes.
 PI_FIX_DRY_RUN=true /strix-fix-loop ~/src/my-app     # read-only triage
 ```
 
+If Pi or Strix stops mid-run, continue the same Pi session with `pi --continue`, then resume by run directory name:
+
+```text
+/strix-resume my-app-20260924-162025-81334
+```
+
+The `run-id` is the last component of the output directory and appears in the `/strix-fix-loop` transcript entry. Add `--output-dir PATH` when using a custom output root that cannot be found from the session transcript.
+
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `-t`, `--target PATH` | current directory | Project directory |
@@ -112,10 +120,12 @@ PI_FIX_DRY_RUN=true /strix-fix-loop ~/src/my-app     # read-only triage
 
 **Scan**
 
-- The project is copied under `TMPDIR`; `.git`, dot-files and dot-directories,
+- The project is copied to `strix/round-N/workspace/target` under the run
+  directory; `.git`, dot-files and dot-directories,
   dependency and build directories, archives, media, and binaries are pruned so
   Strix only sees source, scripts, configuration, dependency manifests,
-  database scripts, and text templates.
+  database scripts, and text templates. The copy is removed after a successful
+  scan unless requested otherwise, and is kept after interruption for resume.
 - Each round gets its own Docker network (`strix-managed=true`), removed
   afterwards; the sandbox is capped by the `STRIX_SANDBOX_*` limits.
 - Strix runs headless with `--scope-mode` and a defensive, local, read-only
@@ -134,12 +144,19 @@ PI_FIX_DRY_RUN=true /strix-fix-loop ~/src/my-app     # read-only triage
 - `--dry-run` (or `PI_FIX_ALLOW_BREAKING=false`) keeps only read-only tools
   active for that turn.
 
+**Resume**
+
+- `loop-state.json` stores the current phase, round, Pi session file, and Strix run name.
+- `/strix-resume <run-id>` resumes an interrupted Strix scan or continues an unfinished Pi fix in the restored Pi session, then proceeds to the next round.
+- A run can only resume in its original Pi session; continue the session that started it with `pi --continue`.
+
 ## Output
 
 Each run is written to `<output>/<project>-<timestamp>-<pid>/`:
 
 ```text
 ~/strix_runs/my-app-20260921-162025-81334/
+├── loop-state.json             # Pi/Strix phase checkpoint
 ├── summary.md                  # round-by-round log
 ├── findings-round-N.txt        # stable finding fingerprints per round
 ├── strix/round-N/
@@ -149,7 +166,8 @@ Each run is written to `<output>/<project>-<timestamp>-<pid>/`:
 │   ├── instruction.md
 │   ├── scan-status.txt
 │   ├── strix.log
-│   └── strix-console.log
+│   ├── strix-console.log
+│   └── workspace/target/       # Kept during a scan and after interruption
 └── pi/round-N/
     ├── prompt.md
     ├── git-status-before.txt
