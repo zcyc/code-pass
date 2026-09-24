@@ -42,7 +42,7 @@ automatically and handed to the agent as soon as Strix finishes.
 
 - macOS or Linux.
 - Docker Engine or Docker Desktop, daemon running.
-- Strix CLI 1.4.1+ — `strix` on `PATH`, `~/.strix/bin/strix`, or `STRIX_BIN`.
+- Strix CLI 1.5.2+ — `strix` on `PATH`, `~/.strix/bin/strix`, or `STRIX_BIN`.
 - A Git worktree for the target project (change tracking).
 - Pi.
 

@@ -39,7 +39,7 @@ pi -e /path/to/codepass
 
 - macOS 或 Linux。
 - Docker Engine 或 Docker Desktop，且 daemon 正在运行。
-- Strix CLI 1.4.1+：`strix` 在 `PATH`、`~/.strix/bin/strix`，或通过 `STRIX_BIN` 指定。
+- Strix CLI 1.5.2+：`strix` 在 `PATH`、`~/.strix/bin/strix`，或通过 `STRIX_BIN` 指定。
 - 目标项目是 Git 工作树（用于变更追踪）。
 - Pi。
 

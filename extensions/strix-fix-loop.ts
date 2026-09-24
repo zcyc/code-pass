@@ -39,7 +39,7 @@ import {
 const STATUS_KEY = "strix-fix-loop";
 const ENTRY_TYPE = "strix-fix-loop";
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
-const MIN_STRIX_VERSION: [number, number, number] = [1, 4, 1];
+const MIN_STRIX_VERSION: [number, number, number] = [1, 5, 2];
 
 const CONTEXT_ERROR_NEEDLES = [
   "context window",
@@ -759,7 +759,7 @@ async function resolveStrixBinary(configured: string): Promise<string> {
       continue;
     }
     if (!versionAtLeast(parsed, MIN_STRIX_VERSION)) {
-      throw new Error(`Strix ${parsed.join(".")} is too old; version 1.4.1 or newer is required`);
+      throw new Error(`Strix ${parsed.join(".")} is too old; version 1.5.2 or newer is required`);
     }
     const help = await tryExecCapture(candidate, ["--help"]);
     if (help === null || help.code !== 0) throw new Error(`cannot read Strix CLI help: ${candidate}`);
