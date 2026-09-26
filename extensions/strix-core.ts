@@ -426,6 +426,11 @@ export function resolveFromCwd(cwd: string, path: string): string {
   return resolve(cwd, path);
 }
 
+/** Keep bare commands on PATH; make relative executable paths absolute. */
+export function resolveExecutablePath(cwd: string, command: string): string {
+  return command.includes("/") ? resolve(cwd, command) : command;
+}
+
 export function sanitizeName(value: string, limit: number): string {
   let result = "";
   for (const char of value) {

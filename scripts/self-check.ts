@@ -15,6 +15,7 @@ import {
   parseDurationMs,
   parseVersion,
   resolveFromCwd,
+  resolveExecutablePath,
   sanitizeName,
   sarifFindings,
   shouldPruneEntry,
@@ -110,6 +111,11 @@ check("budgetPerAttempt splits the total", () => {
 check("relative output paths resolve from Pi cwd", () => {
   assert.equal(resolveFromCwd("/pi/project", "artifacts"), "/pi/project/artifacts");
   assert.equal(resolveFromCwd("/pi/project", "/tmp/artifacts"), "/tmp/artifacts");
+});
+
+check("relative executable paths survive a child cwd change", () => {
+  assert.equal(resolveExecutablePath("/pi/project", "bin/strix"), "/pi/project/bin/strix");
+  assert.equal(resolveExecutablePath("/pi/project", "strix"), "strix");
 });
 
 check("SARIF findings ignore coverage and stay stable", () => {

@@ -18,6 +18,7 @@ import { createWriteStream, promises as fs } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { finished } from "node:stream/promises";
 import {
   USAGE,
   budgetPerAttempt,
@@ -30,6 +31,7 @@ import {
   parseArgs,
   parseVersion,
   resolveFromCwd,
+  resolveExecutablePath,
   sanitizeName,
   sarifFindings,
   shouldPruneEntry,
@@ -1151,9 +1153,10 @@ async function readInstructionFile(raw: string): Promise<string> {
 }
 
 async function resolveStrixBinary(configured: string): Promise<string> {
-  const candidates = configured !== ""
+  const candidates = (configured !== ""
     ? [expandHome(configured)]
-    : ["strix", join(homedir(), ".strix", "bin", "strix")];
+    : ["strix", join(homedir(), ".strix", "bin", "strix")])
+    .map((candidate) => resolveExecutablePath(process.cwd(), candidate));
   for (const candidate of candidates) {
     const version = await tryExecCapture(candidate, ["-v"]);
     if (version === null) continue;
@@ -1289,6 +1292,7 @@ async function spawnLogged(
   options: SpawnLoggedOptions,
 ): Promise<{ code: number; timedOut: boolean }> {
   const log = createWriteStream(options.logPath, { flags: "a", mode: 0o600 });
+  const logFinished = finished(log).catch(() => {});
   const child = spawn(command, args, {
     cwd: options.cwd,
     env: options.env,
@@ -1321,19 +1325,22 @@ async function spawnLogged(
   child.stderr?.on("data", onChunk);
 
   return await new Promise((resolvePromise, rejectPromise) => {
+    let finishPromise: Promise<void> | undefined;
     const finish = (): void => {
+      if (finishPromise !== undefined) return;
       if (timer !== undefined) clearTimeout(timer);
       if (killTimer !== undefined) clearTimeout(killTimer);
       activeChildren.delete(child);
       log.end();
+      finishPromise = logFinished;
     };
     child.on("error", (error) => {
       finish();
-      rejectPromise(error);
+      void finishPromise!.then(() => rejectPromise(error));
     });
     child.on("close", (code) => {
       finish();
-      resolvePromise({ code: code ?? 1, timedOut });
+      void finishPromise!.then(() => resolvePromise({ code: code ?? 1, timedOut }));
     });
   });
 }
