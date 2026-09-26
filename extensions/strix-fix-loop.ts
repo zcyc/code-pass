@@ -704,6 +704,11 @@ async function scanRound(state: RunState, round: number): Promise<RoundScan> {
       if (!(await pathExists(join(strixRunDir!, ".state", "agents.json")))) {
         throw new Error(`Strix run ${runName} has no resumable .state/agents.json checkpoint`);
       }
+      // These are copies from the previous attempt and would shadow resumed run artifacts.
+      await Promise.all([
+        ...COPIED_ARTIFACTS.map((name) => fs.rm(join(roundDir, name), { force: true })),
+        fs.rm(join(roundDir, "vulnerabilities"), { recursive: true, force: true }),
+      ]);
       state.checkpoint.strixRunName = runName;
       await writeCheckpoint(state);
     }
