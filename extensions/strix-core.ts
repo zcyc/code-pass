@@ -457,6 +457,10 @@ export function versionAtLeast(actual: [number, number, number], minimum: [numbe
   return true;
 }
 
+export function isManagedInternalNetwork(inspectOutput: string): boolean {
+  return inspectOutput.trim() === "true|true";
+}
+
 export function shouldPruneEntry(name: string, isDirectory: boolean, isSymbolicLink: boolean): boolean {
   if (isSymbolicLink) return true;
   if (name.startsWith(".")) return true;

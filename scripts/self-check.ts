@@ -11,6 +11,7 @@ import {
   completedRunError,
   fingerprintDigest,
   isBinaryHeader,
+  isManagedInternalNetwork,
   parseArgs,
   parseDurationMs,
   parseVersion,
@@ -213,6 +214,12 @@ check("sanitizeName and versions", () => {
   assert.deepEqual(parseVersion("strix 1.4.1"), [1, 4, 1]);
   assert.equal(versionAtLeast([1, 5, 0], [1, 4, 1]), true);
   assert.equal(versionAtLeast([1, 4, 0], [1, 4, 1]), false);
+});
+
+check("sandbox networks must be managed and internal", () => {
+  assert.equal(isManagedInternalNetwork("true|true\n"), true);
+  assert.equal(isManagedInternalNetwork("true|false\n"), false);
+  assert.equal(isManagedInternalNetwork("false|true\n"), false);
 });
 
 check("instructions and fix prompt", () => {

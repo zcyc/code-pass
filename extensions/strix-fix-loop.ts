@@ -27,6 +27,7 @@ import {
   completedRunError,
   fingerprintDigest,
   isBinaryHeader,
+  isManagedInternalNetwork,
   messageOf,
   parseArgs,
   parseVersion,
@@ -1205,15 +1206,17 @@ async function createNetwork(dockerBin: string, name: string): Promise<void> {
     "network", "ls", "--filter", `name=^${name}$`, "--format", "{{.Name}}",
   ]);
   if (existing.stdout.trim() !== "") {
-    const labels = await execCapture(dockerBin, [
-      "network", "inspect", "--format", '{{ index .Labels "strix-managed" }}', name,
+    const inspection = await execCapture(dockerBin, [
+      "network", "inspect", "--format", '{{ index .Labels "strix-managed" }}|{{.Internal}}', name,
     ]);
-    if (labels.code !== 0 || labels.stdout.trim() !== "true") {
-      throw new Error(`Docker network already exists and is not managed by this extension: ${name}`);
+    if (inspection.code !== 0 || !isManagedInternalNetwork(inspection.stdout)) {
+      throw new Error(`refusing to reuse a Docker network that is not extension-managed and internal: ${name}`);
     }
     return;
   }
-  const created = await execCapture(dockerBin, ["network", "create", "--label", "strix-managed=true", name]);
+  const created = await execCapture(dockerBin, [
+    "network", "create", "--internal", "--label", "strix-managed=true", name,
+  ]);
   if (created.code !== 0) {
     throw new Error(`docker network create failed: ${created.stderr.trim() || created.stdout.trim()}`);
   }
