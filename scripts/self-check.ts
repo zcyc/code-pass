@@ -14,6 +14,7 @@ import {
   parseArgs,
   parseDurationMs,
   parseVersion,
+  resolveFromCwd,
   sanitizeName,
   sarifFindings,
   shouldPruneEntry,
@@ -95,12 +96,20 @@ check("parseDurationMs", () => {
   assert.equal(parseDurationMs("2.5s"), 2500);
   assert.throws(() => parseDurationMs("1x"));
   assert.throws(() => parseDurationMs("0"));
+  assert.throws(() => parseDurationMs("720h"), /maximum timer delay/);
+  assert.throws(() => parseDurationMs("2147483.648"), /maximum timer delay/);
 });
 
 check("budgetPerAttempt splits the total", () => {
   const perRound = Number(budgetPerAttempt("50", 3));
   assert.ok(Math.abs(perRound - 50 / 3) < 1e-9);
+  assert.ok(Number(budgetPerAttempt("0.000000000001", 3)) > 0);
   assert.throws(() => budgetPerAttempt("0", 3));
+});
+
+check("relative output paths resolve from Pi cwd", () => {
+  assert.equal(resolveFromCwd("/pi/project", "artifacts"), "/pi/project/artifacts");
+  assert.equal(resolveFromCwd("/pi/project", "/tmp/artifacts"), "/tmp/artifacts");
 });
 
 check("SARIF findings ignore coverage and stay stable", () => {

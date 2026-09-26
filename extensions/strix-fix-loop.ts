@@ -29,6 +29,7 @@ import {
   messageOf,
   parseArgs,
   parseVersion,
+  resolveFromCwd,
   sanitizeName,
   sarifFindings,
   shouldPruneEntry,
@@ -278,7 +279,9 @@ async function findRunOutputRoots(
   ctx: ExtensionCommandContext,
   args: ResumeArgs,
 ): Promise<string[]> {
-  if (args.outputRoot !== undefined) return [await canonicalPath(expandHome(args.outputRoot))];
+  if (args.outputRoot !== undefined) {
+    return [await canonicalPath(resolveFromCwd(ctx.cwd, expandHome(args.outputRoot)))];
+  }
 
   const sessionManager = ctx.sessionManager as unknown as {
     getBranch?: () => Array<{ customType?: string; data?: unknown }>;
@@ -290,12 +293,12 @@ async function findRunOutputRoots(
     if (data.title !== `strix-fix-loop ${args.runId}` || !Array.isArray(data.lines)) continue;
     for (const line of data.lines) {
       if (typeof line !== "string" || !line.startsWith("output: ")) continue;
-      const runDir = resolve(line.slice("output: ".length));
+      const runDir = resolveFromCwd(ctx.cwd, line.slice("output: ".length));
       if (basename(runDir) === args.runId) roots.add(await canonicalPath(dirname(runDir)));
     }
   }
   if (roots.size > 0) return [...roots];
-  return [await canonicalPath(expandHome(process.env.STRIX_OUTPUT_DIR || "~/strix_runs"))];
+  return [await canonicalPath(resolveFromCwd(ctx.cwd, expandHome(process.env.STRIX_OUTPUT_DIR || "~/strix_runs")))];
 }
 
 function parseCheckpoint(value: unknown): RunCheckpoint {
@@ -412,7 +415,7 @@ async function runStrixFixLoop(pi: ExtensionAPI, ctx: ExtensionCommandContext, o
     throw new Error("strix-fix-loop requires a Git worktree for change tracking");
   }
 
-  const outputRoot = await canonicalPath(expandHome(options.outputRoot));
+  const outputRoot = await canonicalPath(resolveFromCwd(ctx.cwd, expandHome(options.outputRoot)));
   requireOutside(project, outputRoot, "output directory");
   await fs.mkdir(outputRoot, { recursive: true, mode: 0o700 });
 
@@ -978,23 +981,31 @@ async function loadCompletedFix(state: RunState, round: number): Promise<RoundFi
 /**
  * Send the fix prompt to the current agent and wait for it to settle.
  *
- * pi.sendUserMessage() schedules the run asynchronously, so waitForIdle() may
- * race ahead of it; poll until the run (or compaction) is active, then wait for
- * the settled state. A 10s grace period keeps a preflight failure from hanging
- * the loop forever.
+ * pi.sendUserMessage() schedules the run asynchronously, and the session stays
+ * idle while it performs preflight work. Wait for agent_start before waiting
+ * for idle; if preflight has not started the run within 10 seconds, fail
+ * instead of scanning as if a repair had completed.
  */
 async function askAgent(state: RunState, prompt: string): Promise<void> {
   if (!state.ctx.isIdle()) await state.ctx.waitForIdle();
+  let started = false;
   let settled = false;
+  const unsubscribeStart = state.pi.on("agent_start", () => {
+    started = true;
+  });
   const unsubscribe = state.pi.on("agent_settled", () => {
     settled = true;
   });
   try {
     state.pi.sendUserMessage(prompt);
     const deadline = Date.now() + 10_000;
-    while (!settled && state.ctx.isIdle() && Date.now() < deadline) await delay(100);
-    if (!settled && !state.ctx.isIdle()) await state.ctx.waitForIdle();
+    while (!started && !settled && Date.now() < deadline) await delay(100);
+    if (!started && !settled) {
+      throw new Error("Pi did not start the fix agent within 10 seconds; stopping the Strix loop");
+    }
+    if (!settled) await state.ctx.waitForIdle();
   } finally {
+    unsubscribeStart();
     unsubscribe();
   }
 }

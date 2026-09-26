@@ -5,7 +5,7 @@
  * exercise the logic under plain Node (`node scripts/self-check.ts`).
  */
 import { createHash } from "node:crypto";
-import { extname } from "node:path";
+import { extname, resolve } from "node:path";
 
 export type ScanMode = "quick" | "standard" | "deep";
 export type ScopeMode = "auto" | "diff" | "full";
@@ -384,7 +384,7 @@ export function parseDurationMs(raw: string): number {
   if (/^\d+(\.\d+)?$/.test(value)) {
     const seconds = Number(value);
     if (!Number.isFinite(seconds) || seconds <= 0) throw new Error(`duration must be positive: ${raw}`);
-    return seconds * 1000;
+    return checkedDurationMs(seconds * 1000, raw);
   }
   const units: Record<string, number> = { h: 3600, m: 60, s: 1 };
   let rest = value;
@@ -396,7 +396,16 @@ export function parseDurationMs(raw: string): number {
     rest = rest.slice(match[0].length);
   }
   if (!Number.isFinite(total) || total <= 0) throw new Error(`duration must be positive: ${raw}`);
-  return total * 1000;
+  return checkedDurationMs(total * 1000, raw);
+}
+
+function checkedDurationMs(milliseconds: number, raw: string): number {
+  // Node clamps larger setTimeout delays to 1 ms, which can turn a long run
+  // timeout into an immediate timeout.
+  if (!Number.isFinite(milliseconds) || milliseconds > 2_147_483_647) {
+    throw new Error(`duration exceeds the maximum timer delay (2147483647ms): ${raw}`);
+  }
+  return milliseconds;
 }
 
 export function budgetPerAttempt(total: string, attempts: number): string {
@@ -404,8 +413,17 @@ export function budgetPerAttempt(total: string, attempts: number): string {
   if (!Number.isFinite(value) || value <= 0 || !Number.isInteger(attempts) || attempts < 1) {
     throw new Error("budget must be a finite positive number");
   }
-  const text = (value / attempts).toFixed(12).replace(/0+$/, "").replace(/\.$/, "");
-  return text === "" ? "0" : text;
+  const perAttempt = value / attempts;
+  if (perAttempt <= 0 || !Number.isFinite(perAttempt)) {
+    throw new Error("budget per attempt is outside the supported numeric range");
+  }
+  const rounded = perAttempt.toFixed(12).replace(/0+$/, "").replace(/\.$/, "");
+  return rounded === "0" ? String(perAttempt) : rounded;
+}
+
+/** Resolve a user path against Pi's project cwd, not the process cwd. */
+export function resolveFromCwd(cwd: string, path: string): string {
+  return resolve(cwd, path);
 }
 
 export function sanitizeName(value: string, limit: number): string {
