@@ -21,6 +21,7 @@ import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } fro
 import { finished } from "node:stream/promises";
 import {
   USAGE,
+  assistantCompletionError,
   budgetPerAttempt,
   buildFixPrompt,
   buildInstruction,
@@ -993,11 +994,16 @@ async function askAgent(state: RunState, prompt: string): Promise<void> {
   if (!state.ctx.isIdle()) await state.ctx.waitForIdle();
   let started = false;
   let settled = false;
+  let lastAssistantMessage: { stopReason?: unknown; errorMessage?: unknown } | undefined;
   const unsubscribeStart = state.pi.on("agent_start", () => {
     started = true;
   });
   const unsubscribe = state.pi.on("agent_settled", () => {
     settled = true;
+  });
+  const unsubscribeMessage = state.pi.on("message_end", (event) => {
+    const message = event.message as { role?: unknown; stopReason?: unknown; errorMessage?: unknown };
+    if (message.role === "assistant") lastAssistantMessage = message;
   });
   try {
     state.pi.sendUserMessage(prompt);
@@ -1007,9 +1013,16 @@ async function askAgent(state: RunState, prompt: string): Promise<void> {
       throw new Error("Pi did not start the fix agent within 10 seconds; stopping the Strix loop");
     }
     if (!settled) await state.ctx.waitForIdle();
+    const failure = lastAssistantMessage === undefined
+      ? "Pi settled without a final assistant message"
+      : assistantCompletionError(lastAssistantMessage.stopReason, lastAssistantMessage.errorMessage);
+    if (failure !== null) {
+      throw new Error(`Pi fix did not complete (${failure}); resume run ${state.runId} with /strix-resume`);
+    }
   } finally {
     unsubscribeStart();
     unsubscribe();
+    unsubscribeMessage();
   }
 }
 

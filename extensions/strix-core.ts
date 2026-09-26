@@ -461,6 +461,14 @@ export function isManagedInternalNetwork(inspectOutput: string): boolean {
   return inspectOutput.trim() === "true|true";
 }
 
+export function assistantCompletionError(stopReason: unknown, errorMessage: unknown): string | null {
+  if (stopReason === "stop") return null;
+  const reason = typeof stopReason === "string" && stopReason !== "" ? stopReason : "unknown";
+  return typeof errorMessage === "string" && errorMessage !== ""
+    ? `${reason}: ${errorMessage}`
+    : `assistant stopped with ${reason}`;
+}
+
 export function shouldPruneEntry(name: string, isDirectory: boolean, isSymbolicLink: boolean): boolean {
   if (isSymbolicLink) return true;
   if (name.startsWith(".")) return true;

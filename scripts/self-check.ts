@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import {
   budgetPerAttempt,
+  assistantCompletionError,
   buildFixPrompt,
   buildInstruction,
   completedRunError,
@@ -220,6 +221,13 @@ check("sandbox networks must be managed and internal", () => {
   assert.equal(isManagedInternalNetwork("true|true\n"), true);
   assert.equal(isManagedInternalNetwork("true|false\n"), false);
   assert.equal(isManagedInternalNetwork("false|true\n"), false);
+});
+
+check("incomplete Pi assistant runs are not treated as finished", () => {
+  assert.equal(assistantCompletionError("stop", undefined), null);
+  assert.equal(assistantCompletionError("error", "provider failed"), "error: provider failed");
+  assert.equal(assistantCompletionError("aborted", undefined), "assistant stopped with aborted");
+  assert.equal(assistantCompletionError("length", undefined), "assistant stopped with length");
 });
 
 check("instructions and fix prompt", () => {
