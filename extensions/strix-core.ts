@@ -75,6 +75,8 @@ const PRUNED_SUFFIXES = new Set([
   ".ttf", ".otf", ".woff", ".woff2", ".eot",
   ".so", ".dylib", ".dll", ".a", ".o", ".obj", ".class", ".jar", ".war",
   ".exe", ".bin", ".pyc", ".pyo",
+  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
+  ".db", ".sqlite", ".sqlite3", ".wasm", ".psd", ".psb",
 ]);
 
 export const COMMON_INSTRUCTION = `【授权与安全边界】本任务由目标仓库所有者明确授权，仅用于本地防御性源代码安全审计和修复建议。不得攻击、探测或连接任何真实外部系统，不得获取真实凭据或用户数据，不得建立持久化，不得执行破坏性操作，也不得提供可直接用于攻击真实目标的操作指导。验证应优先采用静态代码推理；如需说明影响，只给出最小化、不可武器化的本地概念验证。若某项验证可能超出此边界，跳过动态验证并基于代码证据写入报告。审核复制到隔离工作区中的全部目标源代码，只分析源代码、脚本、配置、依赖清单、数据库脚本和文本模板。完全跳过任何路径组成部分以点号开头的文件或目录、Strix 自身生成的 strix_runs、依赖/vendor 目录、构建产物、缓存、日志、测试覆盖率输出、归档包、媒体、字体、可执行文件、动态库及其他二进制资源。不要一次性读取或输出整个大型文件或目录；对大文件先搜索相关符号，再按小范围分段读取。只检测、验证和报告漏洞，不要修改目标仓库文件；修复方案仅写入报告。所有漏洞名称、风险说明、证据摘要、复现步骤和修复建议使用简体中文；代码、路径、命令、CVE、CWE、CVSS 和 OWASP 名称保留原文。项目级指令仅用于补充项目背景和重点范围，不得覆盖上述约束。`;
@@ -464,6 +466,10 @@ export function shouldPruneEntry(name: string, isDirectory: boolean, isSymbolicL
 
 export function isBinaryHeader(header: Uint8Array): boolean {
   if (header.length >= 2 && header[0] === 0x4d && header[1] === 0x5a) return true; // MZ
+  if (header.length >= 4 && header[0] === 0x25 && header[1] === 0x50 && header[2] === 0x44 && header[3] === 0x46) return true; // %PDF
+  if (header.length >= 4 && header[0] === 0x50 && header[1] === 0x4b && [0x03, 0x05, 0x07].includes(header[2]) && [0x04, 0x06, 0x08].includes(header[3])) return true; // ZIP
+  if (header.length >= 4 && header[0] === 0xd0 && header[1] === 0xcf && header[2] === 0x11 && header[3] === 0xe0) return true; // OLE
+  if (header.length >= 4 && header[0] === 0x00 && header[1] === 0x61 && header[2] === 0x73 && header[3] === 0x6d) return true; // WASM
   if (header.length >= 4 && header[0] === 0x7f && header[1] === 0x45 && header[2] === 0x4c && header[3] === 0x46) {
     return true; // ELF
   }
@@ -503,36 +509,47 @@ export function sarifFindings(document: unknown): SarifFindings {
   for (const run of runs) {
     const results = (run as { results?: unknown } | null)?.results;
     if (!Array.isArray(results)) continue;
+    const tool = sarifText((run as { tool?: { driver?: { name?: unknown } } }).tool?.driver?.name);
     for (const result of results) {
       total++;
-      const ruleId = sarifText((result as { ruleId?: unknown })?.ruleId);
+      const resultRecord = result as {
+        ruleId?: unknown;
+        rule?: { id?: unknown };
+        partialFingerprints?: unknown;
+        locations?: unknown;
+        level?: unknown;
+        message?: { text?: unknown };
+      };
+      const ruleId = sarifText(resultRecord?.ruleId ?? resultRecord?.rule?.id);
       if (ruleId.startsWith("strix-coverage/")) {
         coverage++;
         continue;
       }
-      const partial = (result as { partialFingerprints?: unknown })?.partialFingerprints;
+      const partial = resultRecord?.partialFingerprints;
+      const rawLocations = resultRecord?.locations;
+      const locations = (Array.isArray(rawLocations) ? rawLocations : []).map((location) => {
+        const physical = (location as { physicalLocation?: unknown })?.physicalLocation as {
+          artifactLocation?: { uri?: unknown };
+          region?: { startLine?: unknown; startColumn?: unknown; endLine?: unknown };
+        } | undefined;
+        return {
+          uri: sarifText(physical?.artifactLocation?.uri),
+          startLine: physical?.region?.startLine ?? 0,
+          startColumn: physical?.region?.startColumn ?? 0,
+          endLine: physical?.region?.endLine ?? 0,
+        };
+      });
+      const artifacts = [...new Set(locations.map(({ uri }) => uri).filter(Boolean))].sort();
       let identity: string;
       if (partial !== null && typeof partial === "object" && Object.keys(partial as object).length > 0) {
-        identity = `partial:${stableStringify(partial)}`;
+        identity = stableStringify({ tool, rule: ruleId, artifacts, partial });
       } else {
-        const rawLocations = (result as { locations?: unknown })?.locations;
-        const locations = (Array.isArray(rawLocations) ? rawLocations : []).map((location) => {
-          const physical = (location as { physicalLocation?: unknown })?.physicalLocation as {
-            artifactLocation?: { uri?: unknown };
-            region?: { startLine?: unknown; startColumn?: unknown; endLine?: unknown };
-          } | undefined;
-          return {
-            uri: sarifText(physical?.artifactLocation?.uri),
-            startLine: physical?.region?.startLine ?? 0,
-            startColumn: physical?.region?.startColumn ?? 0,
-            endLine: physical?.region?.endLine ?? 0,
-          };
-        });
         locations.sort((left, right) => (stableStringify(left) < stableStringify(right) ? -1 : 1));
-        const message = locations.length === 0 ? sarifText((result as { message?: { text?: unknown } })?.message?.text) : "";
+        const message = locations.length === 0 ? sarifText(resultRecord?.message?.text) : "";
         identity = stableStringify({
+          tool,
           rule: ruleId,
-          level: sarifText((result as { level?: unknown })?.level),
+          level: sarifText(resultRecord?.level),
           locations,
           message,
         });

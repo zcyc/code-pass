@@ -144,6 +144,33 @@ check("SARIF findings ignore coverage and stay stable", () => {
   assert.throws(() => sarifFindings({}));
 });
 
+check("SARIF identity includes tool, rule and artifact", () => {
+  const partialFingerprints = { "primaryLocationLineHash/v1": "same-source-line" };
+  const result = (ruleId: string, uri: string) => ({
+    ruleId,
+    partialFingerprints,
+    locations: [{ physicalLocation: { artifactLocation: { uri } } }],
+  });
+  const parsed = sarifFindings({
+    runs: [
+      {
+        tool: { driver: { name: "scanner-a" } },
+        results: [result("R1", "src/a.ts"), result("R1", "src/a.ts"), result("R2", "src/a.ts")],
+      },
+      {
+        tool: { driver: { name: "scanner-b" } },
+        results: [
+          result("R1", "src/a.ts"),
+          result("R1", "src/b.ts"),
+          { rule: { id: "R3" }, partialFingerprints, locations: [{ physicalLocation: { artifactLocation: { uri: "src/c.ts" } } }] },
+        ],
+      },
+    ],
+  });
+  assert.equal(parsed.total, 6);
+  assert.equal(parsed.fingerprints.length, 5);
+});
+
 check("completedRunError recognizes run.json states", () => {
   assert.equal(completedRunError({ status: "completed" }), null);
   assert.equal(completedRunError({ completed: true, scan_results: { success: true } }), null);
@@ -167,7 +194,13 @@ check("prune classification", () => {
 check("binary header detection", () => {
   assert.equal(isBinaryHeader(Uint8Array.from([0x7f, 0x45, 0x4c, 0x46])), true);
   assert.equal(isBinaryHeader(Uint8Array.from([0x4d, 0x5a, 0x90, 0x00])), true);
+  assert.equal(isBinaryHeader(Buffer.from("%PDF")), true);
+  assert.equal(isBinaryHeader(Uint8Array.from([0x50, 0x4b, 0x03, 0x04])), true);
+  assert.equal(isBinaryHeader(Buffer.from([0xd0, 0xcf, 0x11, 0xe0])), true);
+  assert.equal(isBinaryHeader(Buffer.from([0x00, 0x61, 0x73, 0x6d])), true);
   assert.equal(isBinaryHeader(Buffer.from("hello")), false);
+  assert.equal(shouldPruneEntry("report.pdf", false, false), true);
+  assert.equal(shouldPruneEntry("report.docx", false, false), true);
 });
 
 check("stableStringify sorts keys", () => {
